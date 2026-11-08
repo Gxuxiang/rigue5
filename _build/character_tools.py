@@ -10,6 +10,23 @@ import re
 from mathutils import Vector
 
 
+def _find_rig(ob):
+    """当前选中的可能是 rig，也可能是 UE 骨架，都换算回 rig。"""
+    if ob is None or ob.type != 'ARMATURE':
+        return None
+    if any(o.name.startswith('RTG_') and o.parent is ob for o in bpy.data.objects):
+        return ob
+    helpers = set()
+    for pb in ob.pose.bones:
+        for c in pb.constraints:
+            tgt = getattr(c, 'target', None)
+            if tgt is not None and tgt.name.startswith('RTG_') and tgt.parent is not None:
+                helpers.add(tgt.parent)
+    if len(helpers) == 1:
+        return next(iter(helpers))
+    return None
+
+
 def _character_parts(rig):
     """找出和这个 rig 配套的：重定向空物体、UE 骨架、网格。"""
     helpers = [o for o in bpy.data.objects
@@ -107,8 +124,8 @@ class CHARACTER_OT_duplicate(bpy.types.Operator):
                                           subtype='TRANSLATION', unit='LENGTH')
 
     def execute(self, context):
-        rig = context.active_object
-        if rig is None or rig.type != 'ARMATURE':
+        rig = _find_rig(context.active_object)
+        if rig is None:
             self.report({'ERROR'}, '请先选中角色的 rig')
             return {'CANCELLED'}
         try:
@@ -117,6 +134,37 @@ class CHARACTER_OT_duplicate(bpy.types.Operator):
             self.report({'ERROR'}, str(exc))
             return {'CANCELLED'}
         self.report({'INFO'}, '已复制 %d 个对象，新骨架：%s' % (count, name))
+        return {'FINISHED'}
+
+
+class CHARACTER_OT_toggle_ue(bpy.types.Operator):
+    """在视口里显示/隐藏 UE 骨架，导出 FBX 前需要它可见可选"""
+    bl_idname = 'character.toggle_ue_skeleton'
+    bl_label = '显示 UE 骨架（导出用）'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        rig = _find_rig(context.active_object)
+        if rig is None:
+            self.report({'ERROR'}, '请先选中角色的 rig')
+            return {'CANCELLED'}
+        parts = _character_parts(rig)
+        root = parts[1]
+        mesh = parts[2]
+        if root is None:
+            self.report({'ERROR'}, '找不到 UE 骨架')
+            return {'CANCELLED'}
+        show = root.hide_get()
+        root.hide_set(not show)
+        if show:
+            for o in bpy.data.objects:
+                o.select_set(False)
+            root.select_set(True)
+            if mesh:
+                mesh.select_set(True)
+            self.report({'INFO'}, '已显示并选中 %s + 网格，可以导出 FBX 了' % root.name)
+        else:
+            self.report({'INFO'}, '已隐藏 UE 骨架')
         return {'FINISHED'}
 
 
@@ -134,13 +182,14 @@ class VIEW3D_PT_character_tools(bpy.types.Panel):
         col = layout.column(align=True)
         col.enabled = is_rig
         col.operator('character.duplicate_character', icon='DUPLICATE', text='复制当前角色')
+        col.operator('character.toggle_ue_skeleton', icon='HIDE_OFF', text='显示/隐藏 UE 骨架')
         if not is_rig:
             layout.label(text='先选中角色的 rig', icon='INFO')
-        layout.label(text='复制后各自独立摆姿势', icon='BLANK1')
+        layout.label(text='根运动：物体模式下移动 rig', icon='BLANK1')
 
 
 def register():
-    for cls in (CHARACTER_OT_duplicate, VIEW3D_PT_character_tools):
+    for cls in (CHARACTER_OT_duplicate, CHARACTER_OT_toggle_ue, VIEW3D_PT_character_tools):
         try:
             bpy.utils.register_class(cls)
         except ValueError:

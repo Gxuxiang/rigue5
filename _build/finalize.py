@@ -95,6 +95,19 @@ for side in ('L', 'R'):
         if b in rig_ob.pose.bones:
             rig_ob.pose.bones[b]['IK_Stretch'] = 0.0
 
+# root motion is done by moving the *rig* object; the mesh and the UE skeleton
+# must never be transformed by hand (the mesh sits under a 0.01-scaled parent,
+# so dragging it moves it 1 cm per unit, and scaling it explodes the character)
+for name in ('rig', 'root', 'SKM_Manny'):
+    ob = objs.get(name)
+    if ob:
+        ob.lock_scale = (True, True, True)
+for name in ('root', 'SKM_Manny'):
+    ob = objs.get(name)
+    if ob:
+        ob.lock_location = (True, True, True)
+        ob.lock_rotation = (True, True, True)
+
 # bending the body must carry the neck and the head with it (otherwise the head
 # stays upright / twists off the neck)
 torso = rig_ob.pose.bones['torso']

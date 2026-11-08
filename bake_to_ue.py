@@ -30,6 +30,13 @@ def bake_pose_to_ue(root=None, rig=None, clear_helpers=True):
     if root.animation_data and root.animation_data.action:
         root.animation_data.action = None
 
+    # UE 骨架在视口里默认是隐藏的，隐藏的对象进不了姿态模式也选不中骨骼，
+    # 烘焙会直接报 "Nothing to bake"，所以先临时显示出来
+    was_hidden = root.hide_get()
+    root.hide_set(False)
+    for coll in root.users_collection:
+        coll.hide_viewport = False
+
     for o in bpy.data.objects:
         o.select_set(False)
     root.select_set(True)
@@ -51,6 +58,9 @@ def bake_pose_to_ue(root=None, rig=None, clear_helpers=True):
         bake_types={'POSE'},
     )
     bpy.ops.object.mode_set(mode='OBJECT')
+
+    if was_hidden:
+        root.hide_set(True)
 
     # 约束已经烘进关键帧，删掉 RTG helper 物体让文件保持干净
     if clear_helpers:
