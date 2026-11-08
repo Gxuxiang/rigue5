@@ -137,6 +137,39 @@ class CHARACTER_OT_duplicate(bpy.types.Operator):
         return {'FINISHED'}
 
 
+def export_character(rig, filepath):
+    """导出这个角色的 root + 网格，动画（含根运动）一起烘焙进 FBX。"""
+    helpers, root, mesh = _character_parts(rig)
+    if root is None or mesh is None:
+        raise RuntimeError('找不到 UE 骨架或网格')
+    hidden = root.hide_get()
+    root.hide_set(False)
+    for o in bpy.data.objects:
+        o.select_set(False)
+    root.select_set(True)
+    mesh.select_set(True)
+    bpy.context.view_layer.objects.active = root
+    try:
+        bpy.ops.export_scene.fbx(
+            filepath=filepath,
+            use_selection=True,
+            object_types={'ARMATURE', 'MESH'},
+            bake_anim=True,
+            bake_anim_use_all_bones=True,
+            bake_anim_use_nla_strips=False,
+            bake_anim_use_all_actions=False,
+            bake_anim_force_startend_keying=True,
+            bake_anim_step=1,
+            bake_anim_simplify_factor=0.0,
+            add_leaf_bones=False,
+            primary_bone_axis='Y',
+            secondary_bone_axis='X',
+        )
+    finally:
+        root.hide_set(hidden)
+    return root.name
+
+
 class CHARACTER_OT_toggle_ue(bpy.types.Operator):
     """在视口里显示/隐藏 UE 骨架，导出 FBX 前需要它可见可选"""
     bl_idname = 'character.toggle_ue_skeleton'
@@ -168,6 +201,41 @@ class CHARACTER_OT_toggle_ue(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class CHARACTER_OT_export_fbx(bpy.types.Operator):
+    """把当前角色导出成 FBX（动画 + 根运动一起烘焙）"""
+    bl_idname = 'character.export_fbx'
+    bl_label = '导出 FBX（含根运动）'
+    bl_options = {'REGISTER'}
+
+    filepath: bpy.props.StringProperty(subtype='FILE_PATH')
+
+    def invoke(self, context, event):
+        rig = _find_rig(context.active_object)
+        if rig is None:
+            self.report({'ERROR'}, '请先选中角色的 rig')
+            return {'CANCELLED'}
+        if not self.filepath:
+            base = bpy.path.basename(bpy.data.filepath)
+            base = base.rsplit('.', 1)[0] if base else 'character'
+            self.filepath = bpy.path.abspath('//%s_export.fbx' % base)
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def execute(self, context):
+        rig = _find_rig(context.active_object)
+        if rig is None:
+            self.report({'ERROR'}, '请先选中角色的 rig')
+            return {'CANCELLED'}
+        path = bpy.path.ensure_ext(self.filepath, '.fbx')
+        try:
+            root_name = export_character(rig, path)
+        except Exception as exc:
+            self.report({'ERROR'}, str(exc))
+            return {'CANCELLED'}
+        self.report({'INFO'}, '已导出 %s 到 %s' % (root_name, path))
+        return {'FINISHED'}
+
+
 class VIEW3D_PT_character_tools(bpy.types.Panel):
     bl_label = '角色工具'
     bl_space_type = 'VIEW_3D'
@@ -183,13 +251,15 @@ class VIEW3D_PT_character_tools(bpy.types.Panel):
         col.enabled = is_rig
         col.operator('character.duplicate_character', icon='DUPLICATE', text='复制当前角色')
         col.operator('character.toggle_ue_skeleton', icon='HIDE_OFF', text='显示/隐藏 UE 骨架')
+        col.operator('character.export_fbx', icon='EXPORT', text='导出 FBX（含根运动）')
         if not is_rig:
             layout.label(text='先选中角色的 rig', icon='INFO')
         layout.label(text='根运动：物体模式下移动 rig', icon='BLANK1')
 
 
 def register():
-    for cls in (CHARACTER_OT_duplicate, CHARACTER_OT_toggle_ue, VIEW3D_PT_character_tools):
+    for cls in (CHARACTER_OT_duplicate, CHARACTER_OT_export_fbx, CHARACTER_OT_toggle_ue,
+                VIEW3D_PT_character_tools):
         try:
             bpy.utils.register_class(cls)
         except ValueError:
