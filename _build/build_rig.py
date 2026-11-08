@@ -186,6 +186,13 @@ if rig is None or rig == old_rig:
 log("rig bones:", len(rig.data.bones))
 log("DEF bones:", len([b for b in rig.data.bones if b.name.startswith('DEF-')]))
 
+# ---------------------------------------------------------------- root motion
+# UE writes root motion on the skeleton's root *node*: exporting an animation
+# from UE gives an FBX whose top node carries the translation (Blender imports
+# that as the armature object's animation, with 160 bones and no "root" bone).
+# So we keep the armature object as the root and drive its location instead of
+# adding an extra root bone - that matches what UE produces and expects.
+
 # --------------------------------------------------------------- retargeting
 # The UE skeleton was imported from FBX, so its bone rest orientations have
 # nothing in common with the rig's DEF bones.  A plain copy-rotation would
@@ -234,6 +241,18 @@ for ue_bone, entries in sorted(rt.items()):
         e.parent_bone = rg_bone
         pending.append((e, ue_bone, rg_bone, inf))
 
+# extra helper that carries the root motion: it sits at the world origin at rest
+# and rides on DEF-spine, so the root bone gets exactly the rig's translation
+root_empty = bpy.data.objects.new('RTG_root__DEF-spine', None)
+coll.objects.link(root_empty)
+root_empty.empty_display_type = 'PLAIN_AXES'
+root_empty.empty_display_size = 0.05
+root_empty.hide_render = True
+root_empty.parent = rig
+root_empty.parent_type = 'BONE'
+root_empty.parent_bone = 'DEF-spine'
+pending.append((root_empty, 'root', 'DEF-spine', 1.0))
+
 bpy.context.view_layer.update()
 
 # place every helper so that, at rest, it coincides with the UE bone's rest
@@ -242,10 +261,17 @@ bpy.context.view_layer.update()
 targets = {}
 for e, ue_bone, rg_bone, inf in pending:
     rig_rest = rig.matrix_world @ rig.data.bones[rg_bone].matrix_local
-    ue_rest = ue.matrix_world @ ue.data.bones[ue_bone].matrix_local
+    if ue_bone == 'root':
+        ue_rest = Matrix.Identity(4)      # the armature object's own space
+    else:
+        ue_rest = ue.matrix_world @ ue.data.bones[ue_bone].matrix_local
     # at rest the helper must sit exactly on the UE bone's rest orientation;
     # its basis (rig_rest^-1 * ue_rest) then makes it follow as  rig_pose * C
-    desired = Matrix.Translation(rig_rest.to_translation()) @ ue_rest.to_quaternion().to_matrix().to_4x4()
+    if ue_bone == 'root':
+        desired = (Matrix.Translation(ue_rest.to_translation())
+                   @ ue_rest.to_quaternion().to_matrix().to_4x4())
+    else:
+        desired = Matrix.Translation(rig_rest.to_translation()) @ ue_rest.to_quaternion().to_matrix().to_4x4()
     pb = rig.pose.bones[rg_bone]
     P = rig.matrix_world @ pb.matrix @ Matrix.Translation((0, pb.bone.length, 0))
     e.matrix_basis = P.inverted() @ desired
@@ -270,6 +296,8 @@ log("helper placement: max rot err %.6f deg, max loc err %.6f m"
 
 added = 0
 for e, ue_bone, rg_bone, inf in pending:
+    if ue_bone == 'root':
+        continue    # handled below as an object-level constraint
     pb = ue.pose.bones[ue_bone]
     c = pb.constraints.new('COPY_ROTATION')
     c.name = 'RTG-rot:%s' % rg_bone
@@ -281,19 +309,25 @@ for e, ue_bone, rg_bone, inf in pending:
     c.influence = inf
     added += 1
 
-# pelvis follows the body translation through DEF-spine
-pb = ue.pose.bones['pelvis']
-for c in list(pb.constraints):
-    if c.name.startswith('RTG-loc'):
-        pb.constraints.remove(c)
-cl = pb.constraints.new('COPY_LOCATION')
-cl.name = 'RTG-loc:DEF-spine'
-cl.target = rig
-cl.subtarget = 'DEF-spine'
+# root motion: the armature object itself rides on DEF-spine (the rig's body
+# motion), and the pelvis keeps only its rotation - exactly like the FBX that
+# UE produces for a root-motion animation
+for c in list(ue.constraints):
+    if c.name.startswith('RTG-'):
+        ue.constraints.remove(c)
+cl = ue.constraints.new('COPY_LOCATION')
+cl.name = 'RTG-loc:root'
+cl.target = bpy.data.objects['RTG_root__DEF-spine']
 cl.owner_space = 'WORLD'
 cl.target_space = 'WORLD'
 cl.use_offset = False
 cl.head_tail = 0.0
+
+# the pelvis must not copy the translation any more (the object carries it)
+pb = ue.pose.bones['pelvis']
+for c in list(pb.constraints):
+    if c.name.startswith('RTG-loc'):
+        pb.constraints.remove(c)
 
 # The Manny's clavicles hang off spine_05, which now follows the rig's neck
 # base: pin their position to the rig's shoulder so turning the neck does not

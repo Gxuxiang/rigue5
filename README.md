@@ -148,11 +148,22 @@ Rigify 面板两个角色都能用（`rig_id` 相同，面板按当前激活对�
    否则导出的是静止姿势（`b.fbx` / `c.fbx` 就是这样，里面一帧动画都没有）；
 3. 或者先跑 `bake_to_ue.py` 把动作烘到 `root` 骨骼上再导出。
 
-**根运动落在哪根骨头上**：这套 FBX 没有 `root` 骨骼，`pelvis` 就是最顶层关节
-（其余无父级的是 `ik_foot_root`、`ik_hand_root`、`interaction`、`center_of_mass`）。
-所以位移被烘到 `pelvis` 上，在 UE 里这就是根运动——前提是你在 UE 里看到的
-Skeleton 的根骨也是 `pelvis`。如果你的 UE 资产另有一根 `root` 骨，告诉我，
-我在 Blender 里补一根 `root` 并把位移改到它上面。
+**根运动落在哪**：和 UE 自己导出的一致——位移挂在**骨架节点（armature 对象）**上，
+骨骼本身只有旋转。实测对比你给的 `root_anim.fbx`（UE 导出的根运动动画）：
+
+| | 你的 `root_anim.fbx` | 本文件的导出 |
+| --- | --- | --- |
+| 骨骼数 | 160 | 160 |
+| 无父级关节 | pelvis、ik_foot_root、ik_hand_root、interaction、center_of_mass | 完全相同 |
+| 对象级动画通道 | 9（location / rotation / scale） | 9 |
+| 位移曲线 | location.idx1：−2.00 → 0.00 | location.idx1：0.00 → 2.00 |
+| 骨骼位移 | 无 | 无 |
+
+也就是说两边的动画结构完全一致：都是“根节点平移 + 骨骼旋转”，UE 导入后能识别成根运动。
+（方向符号不同只是因为我测试时往 +Y 走、你往 −Y 走，Manny 面向 −Y，正常走路请朝 −Y。）
+
+具体做法：`RTG_root__DEF-spine` 这个辅助空物体跟着 `DEF-spine` 走，UE 骨架对象用
+Copy Location 跟随它；`pelvis` 只保留旋转约束，不再复制位移，避免位移被算两次。
 
 ## 导出回 UE5
 
