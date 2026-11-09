@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """Tidy up the generated blend: collections, readme, viewport state."""
 import bpy
+from math import radians
+from mathutils import Matrix
 
 BLEND = r"D:\Projects\UE5Anim\rigue5_rigified.blend"
 bpy.ops.wm.open_mainfile(filepath=BLEND)
@@ -114,13 +116,15 @@ torso = rig_ob.pose.bones['torso']
 torso['neck_follow'] = 1.0
 torso['head_follow'] = 1.0
 
-# the neck widget is generated with twice the radius of the head widget, so it
-# reads as a huge hoop crossing the chest - shrink it into a collar
+# Fit the collar to the neck and tilt it so it remains readable from the front.
 wgt = bpy.data.objects.get('WGT-rig_neck')
 if wgt:
-    for v in wgt.data.vertices:
-        v.co.x *= 0.45
-        v.co.z *= 0.45
+    wgt.data.transform(
+        Matrix.Translation((0, 0.59, 0))
+        @ Matrix.Rotation(radians(36), 4, 'X')
+        @ Matrix.Translation((0, -0.5, 0))
+        @ Matrix.Diagonal((0.45, 1, 0.45, 1))
+    )
     wgt.data.update()
 
 # the helpers must stay evaluated by the depsgraph (they drive the constraints)
@@ -161,9 +165,13 @@ README = """Rigify => UE5 Manny  (由 rigue5.blend 自动生成)
      打开文件时选“允许执行脚本”，或 偏好设置 > 保存和加载 > 自动运行 Python 脚本。
 
 【导出回 UE5】
-  方式 A（推荐）：选中 root + SKM_Manny，文件 > 导出 > FBX，
+  方式 A（推荐）：选中 rig，N 面板 > Rigify > 角色工具，
+      「动作」菜单选要导出的 Action（或「当前时间轴」），
+      再点「导出 FBX（含根运动）」。选动作时按该动作自己的帧范围导出，
+      导出完自动还原当前动作和场景帧范围。
+  方式 B：选中 root + SKM_Manny，文件 > 导出 > FBX，
       勾选 “Bake Animation / 烘焙动画”。约束会在烘焙时被采样成 UE 骨骼的关键帧。
-  方式 B：在文本编辑器里打开 bake_to_ue.py 并运行，
+  方式 C：在文本编辑器里打开 bake_to_ue.py 并运行，
       把当前动作烘焙成 root 上的关键帧并移除 RTG 约束（得到干净的可导出文件）。
 
 【注意】

@@ -241,17 +241,22 @@ for ue_bone, entries in sorted(rt.items()):
         e.parent_bone = rg_bone
         pending.append((e, ue_bone, rg_bone, inf))
 
-# extra helper that carries the root motion: it sits at the world origin at rest
-# and rides on DEF-spine, so the root bone gets exactly the rig's translation
+# Carry the pelvis displacement in rig space. Bone parenting an offset at the
+# origin would rotate that offset around the pelvis and slide the whole mesh.
 root_empty = bpy.data.objects.new('RTG_root__DEF-spine', None)
 coll.objects.link(root_empty)
 root_empty.empty_display_type = 'PLAIN_AXES'
 root_empty.empty_display_size = 0.05
 root_empty.hide_render = True
 root_empty.parent = rig
-root_empty.parent_type = 'BONE'
-root_empty.parent_bone = 'DEF-spine'
-pending.append((root_empty, 'root', 'DEF-spine', 1.0))
+root_empty.location = -rig.data.bones['DEF-spine'].head_local
+root_location = root_empty.constraints.new('COPY_LOCATION')
+root_location.target = rig
+root_location.subtarget = 'DEF-spine'
+root_location.owner_space = 'LOCAL'
+root_location.target_space = 'POSE'
+root_location.use_offset = True
+root_empty.hide_set(True)
 
 bpy.context.view_layer.update()
 
@@ -261,17 +266,10 @@ bpy.context.view_layer.update()
 targets = {}
 for e, ue_bone, rg_bone, inf in pending:
     rig_rest = rig.matrix_world @ rig.data.bones[rg_bone].matrix_local
-    if ue_bone == 'root':
-        ue_rest = Matrix.Identity(4)      # the armature object's own space
-    else:
-        ue_rest = ue.matrix_world @ ue.data.bones[ue_bone].matrix_local
+    ue_rest = ue.matrix_world @ ue.data.bones[ue_bone].matrix_local
     # at rest the helper must sit exactly on the UE bone's rest orientation;
     # its basis (rig_rest^-1 * ue_rest) then makes it follow as  rig_pose * C
-    if ue_bone == 'root':
-        desired = (Matrix.Translation(ue_rest.to_translation())
-                   @ ue_rest.to_quaternion().to_matrix().to_4x4())
-    else:
-        desired = Matrix.Translation(rig_rest.to_translation()) @ ue_rest.to_quaternion().to_matrix().to_4x4()
+    desired = Matrix.Translation(rig_rest.to_translation()) @ ue_rest.to_quaternion().to_matrix().to_4x4()
     pb = rig.pose.bones[rg_bone]
     P = rig.matrix_world @ pb.matrix @ Matrix.Translation((0, pb.bone.length, 0))
     e.matrix_basis = P.inverted() @ desired
@@ -296,8 +294,6 @@ log("helper placement: max rot err %.6f deg, max loc err %.6f m"
 
 added = 0
 for e, ue_bone, rg_bone, inf in pending:
-    if ue_bone == 'root':
-        continue    # handled below as an object-level constraint
     pb = ue.pose.bones[ue_bone]
     c = pb.constraints.new('COPY_ROTATION')
     c.name = 'RTG-rot:%s' % rg_bone
@@ -317,7 +313,7 @@ for c in list(ue.constraints):
         ue.constraints.remove(c)
 cl = ue.constraints.new('COPY_LOCATION')
 cl.name = 'RTG-loc:root'
-cl.target = bpy.data.objects['RTG_root__DEF-spine']
+cl.target = root_empty
 cl.owner_space = 'WORLD'
 cl.target_space = 'WORLD'
 cl.use_offset = False
@@ -346,7 +342,9 @@ for side, S in (('l', 'L'), ('r', 'R')):
     cl.use_offset = False
     cl.head_tail = 0.0
 
-log("helpers:", len(pending), "constraints added:", added, "problems:", problems)
+ue_map.add_ik_follow(ue)
+
+log("helpers:", len(pending), "rotation constraints added:", added, "problems:", problems)
 
 bpy.context.view_layer.update()
 

@@ -97,9 +97,27 @@ def build_retarget_map():
     return m
 
 
-# Bones that must NOT be driven (IK helpers / markers of the UE skeleton).
-SKIP = {'root', 'ik_foot_root', 'ik_foot_l', 'ik_foot_r', 'ik_hand_root',
-        'ik_hand_gun', 'ik_hand_l', 'ik_hand_r', 'interaction', 'center_of_mass'}
+def add_ik_follow(ue):
+    """Make Manny's export IK bones follow the evaluated hand and foot bones."""
+    targets = {
+        'ik_foot_l': 'foot_l',
+        'ik_foot_r': 'foot_r',
+        'ik_hand_l': 'hand_l',
+        'ik_hand_r': 'hand_r',
+        'ik_hand_gun': 'hand_r',
+    }
+    for ik_name, target_name in targets.items():
+        bone = ue.pose.bones[ik_name]
+        name = 'RTG-ik:' + target_name
+        constraint = bone.constraints.get(name)
+        if constraint is None:
+            constraint = bone.constraints.new('COPY_TRANSFORMS')
+            constraint.name = name
+        constraint.target = ue
+        constraint.subtarget = target_name
+        # The rest transforms match, but the IK bones have different parents.
+        constraint.owner_space = 'POSE'
+        constraint.target_space = 'POSE'
 
 
 def build_fit_map():
