@@ -133,6 +133,12 @@ POSE_FINGER_CHAINS = {
     },
 }
 
+# 捕捉坐标（x 右、y 下、z 朝后）-> 角色世界坐标（x 右、y 后、z 上）。
+# 直立、正面朝镜头的人对应恒等旋转。倒立/躺姿时用它把整个角色转到参考朝向。
+POSE_CAP_TO_WORLD = Matrix(((1.0, 0.0, 0.0),
+                            (0.0, 0.0, 1.0),
+                            (0.0, -1.0, 0.0)))
+
 POSE_MARKER = 'RIGUE5_POSE_RESULT '
 POSE_COMFY_ROOT = r'D:\Comfy-Desktop\ComfyUI-Installs\ComfyUI\ComfyUI'
 POSE_DETECTION_DIR = r'D:\Comfy-Desktop\ComfyUI-Shared\models\detection'
@@ -557,10 +563,19 @@ def _pose_build_targets(rig, kp, vis, ground=True, torso_lean=True,
     scale = _pose_auto_scale(kp, vis, rest)
     H0 = rest['H0']
     warnings = []
-    # 捕捉坐标 y 向下：肩在髋下方时，说明参考图是倒立/手倒立。脚踩地的
-    # 解算没法表达倒立，提前提示比默默摆错更有用。
-    if up_cap.y > 0.35:
-        warnings.append('参考图可能是倒立/手倒立；本工具按脚踩地处理，姿势需要手动调整。')
+    # 身体 up 与图像 up 的夹角。直立时约 0°，躺姿约 90°，倒立约 180°。
+    # 夹角大时不再假设“脚踩地 + 脊柱竖直”，而是把整个角色按参考朝向
+    # 全局旋转（root），再按网格最低点贴地。
+    tilt = math.degrees(up_cap.angle(Vector((0.0, -1.0, 0.0))))
+    global_root = False
+    root_rotation = None
+    if tilt > 60.0:
+        rg = POSE_CAP_TO_WORLD @ r_body.transposed()
+        if rg.determinant() > 0.0:
+            global_root = True
+            root_rotation = rg
+        else:
+            warnings.append('检测到倒立/躺姿，但身体坐标系是左手系，已按脚踩地处理。')
 
     # 参考图里的人可能侧身/背身；把整个角色绕 Z 转到相同的相对朝向。
     root_yaw = 0.0
@@ -655,7 +670,7 @@ def _pose_build_targets(rig, kp, vis, ground=True, torso_lean=True,
         l_s.normalize()
         f_sh_cap = _pose_frame(f_s, l_s, u_s)
 
-        if torso_lean:
+        if torso_lean and not global_root:
             f_sh_arm = r_global @ f_sh_cap
             r_delta = f_sh_arm @ rest['body_frame'].transposed()
             if r_delta.determinant() < 0.0:
@@ -879,7 +894,7 @@ def _pose_build_targets(rig, kp, vis, ground=True, torso_lean=True,
 
     base = build(Vector((0.0, 0.0, 0.0)))
     shift = Vector((0.0, 0.0, 0.0))
-    if ground:
+    if ground and not global_root:
         zs = []
         for idx in (13, 14):
             if vis[idx] >= 0.5:
@@ -893,7 +908,11 @@ def _pose_build_targets(rig, kp, vis, ground=True, torso_lean=True,
     targets['scale'] = scale
     targets['shift'] = shift
     targets['root_yaw'] = root_yaw
-    targets['apply_root_yaw'] = bool(face_reference)
+    targets['apply_root_yaw'] = bool(face_reference and not global_root)
+    targets['root_rotation'] = root_rotation
+    targets['global_root'] = global_root
+    # 不只倒立：坐/躺/跪姿的最低点也不一定是脚。统一按整个网格的最低点贴地。
+    targets['ground_via_mesh'] = bool(ground)
     targets['warnings'] = targets.get('warnings', [])
     return targets
 
@@ -1120,24 +1139,52 @@ def _pose_apply(rig, targets):
     bpy.context.view_layer.update()
     _pose_apply_fingers(rig, targets)
     _pose_apply_root_yaw(rig, targets)
+    _pose_ground_mesh(rig, targets)
     return targets
 
 
 def _pose_apply_root_yaw(rig, targets):
-    if not targets.get('apply_root_yaw', True):
-        return
-    yaw = float(targets.get('root_yaw') or 0.0)
     pb = rig.pose.bones.get('root')
     if pb is None:
         return
+    rot = targets.get('root_rotation')
+    if rot is None and not targets.get('apply_root_yaw', True):
+        return
     # 保留 root 当前的位移（根运动），旋转统一回到静止朝向 + 参考朝向，
-    # 这样连续识别两张图不会把 yaw 累加。
+    # 这样连续识别两张图不会把 yaw 累加。非直立时 rot 是完整的全局朝向。
     loc = pb.matrix.to_translation()
     rest_q = pb.bone.matrix_local.to_quaternion()
-    target_q = Quaternion((0.0, 0.0, 1.0), yaw) @ rest_q
+    if rot is not None:
+        q_global = rot.to_quaternion()
+    else:
+        q_global = Quaternion((0.0, 0.0, 1.0),
+                              float(targets.get('root_yaw') or 0.0))
+    target_q = q_global @ rest_q
     _pose_set_bone_matrix(
         rig, 'root',
         Matrix.Translation(loc) @ target_q.to_matrix().to_4x4())
+    bpy.context.view_layer.update()
+
+
+def _pose_ground_mesh(rig, targets):
+    """非直立姿势：按整个网格的最低点贴地（倒立时最低点是手/头）。"""
+    if not targets.get('ground_via_mesh'):
+        return
+    pb = rig.pose.bones.get('root')
+    mesh = _character_parts(rig)[2] if pb is not None else None
+    if pb is None or mesh is None:
+        return
+    bpy.context.view_layer.update()
+    dg = bpy.context.evaluated_depsgraph_get()
+    ev = mesh.evaluated_get(dg)
+    me = ev.to_mesh()
+    zs = [(ev.matrix_world @ v.co).z for v in me.vertices]
+    ev.to_mesh_clear()
+    if not zs:
+        return
+    m = pb.matrix.copy()
+    m.translation.z -= min(zs)
+    _pose_set_bone_matrix(rig, 'root', m)
     bpy.context.view_layer.update()
 
 
@@ -1184,7 +1231,7 @@ def _pose_apply_fk(rig, targets, ground=True):
                 Matrix.Translation(pos) @ (r_delta @ rest_q).to_matrix().to_4x4())
             bpy.context.view_layer.update()
 
-    if ground:
+    if ground and not targets.get('global_root'):
         rest_z = rig.data.bones['DEF-foot.L'].head_local.z
         zs = []
         for S in ('L', 'R'):
@@ -1202,6 +1249,7 @@ def _pose_apply_fk(rig, targets, ground=True):
                         @ ptorso.matrix)
                     bpy.context.view_layer.update()
     _pose_apply_root_yaw(rig, targets)
+    _pose_ground_mesh(rig, targets)
     return targets
 
 
@@ -2141,7 +2189,7 @@ class VIEW3D_PT_character_tools(bpy.types.Panel):
         pcol.operator('character.pose_from_clipboard', text='剪贴板 ➜ 姿态',
                       icon='PASTEDOWN')
         row = pcol.row(align=True)
-        row.prop(scene, 'character_pose_ground', text='脚部贴地')
+        row.prop(scene, 'character_pose_ground', text='贴地')
         row.prop(scene, 'character_pose_depth', text='深度')
         row.prop(scene, 'character_pose_mirror', text='镜像')
         row2 = pcol.row(align=True)
@@ -2205,7 +2253,9 @@ def register():
         ],
         default='auto')
     bpy.types.Scene.character_pose_ground = bpy.props.BoolProperty(
-        name='脚部贴地', default=True)
+        name='贴地',
+        description='按整个网格的最低点贴地（直立是脚、坐/躺是背/臀、倒立是手/头）',
+        default=True)
     bpy.types.Scene.character_pose_depth = bpy.props.FloatProperty(
         name='深度', min=0.0, max=1.0, default=0.7)
     bpy.types.Scene.character_pose_mirror = bpy.props.BoolProperty(
