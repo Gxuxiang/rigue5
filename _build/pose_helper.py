@@ -499,7 +499,7 @@ def _torch_dtype_for(comfy_mm, comfy_utils, sd):
     return torch, load_device, torch_dtype, manual_cast_dtype
 
 
-def _load_sam3d_model(ckpt_path: str, root: str | None = None):
+def _load_sam3d_model(ckpt_path: str, root: str | None = None, fp32: bool = False):
     import torch
 
     root = root or _comfy_root({})
@@ -525,6 +525,12 @@ def _load_sam3d_model(ckpt_path: str, root: str | None = None):
     torch_mod, load_device, torch_dtype, manual_cast = _torch_dtype_for(
         comfy_mm, comfy_utils, sd
     )
+    if fp32:
+        # ComfyUI 的 SAM 3D Body 手部精修（inference_type="full"）在
+        # bf16/fp16 权重下会报 Float/Half 不匹配；手部精修时用 fp32 最稳。
+        # 4070 Ti Super 16GB 跑 2.8GB 模型没问题。
+        torch_dtype = torch.float32
+        manual_cast = None
     ops = None
     try:
         quant_config = comfy_utils.detect_layer_quantization(sd, "")
@@ -625,7 +631,8 @@ def estimate_sam3d(req: dict, image_rgb) -> dict:
 
     emit_progress(0.25, "加载 SAM 3D Body…")
     root = _comfy_root(req)
-    model, device = _load_sam3d_model(ckpt, root)
+    model, device = _load_sam3d_model(
+        ckpt, root, fp32=bool(req.get("refine_hands")))
 
     if root not in sys.path:
         sys.path.insert(0, root)
@@ -637,18 +644,35 @@ def estimate_sam3d(req: dict, image_rgb) -> dict:
 
     emit_progress(0.65, "SAM 3D Body 推理…")
     t0 = time.time()
-    with torch.inference_mode():
-        out = run_batched_frames(
+
+    def _run(kind):
+        return run_batched_frames(
             model,
             [frame],
             boxes,
             None,
             model.image_size,
-            inference_type,
+            kind,
             cam_int=None,
             pbar=None,
             crops_per_chunk=1,
         )
+
+    with torch.inference_mode():
+        try:
+            out = _run(inference_type)
+        except RuntimeError as exc:
+            msg = str(exc).lower()
+            # 手部精修是可选增强：显存不够或 ComfyUI 的 fp16/fp32 抖动时
+            # 退回普通 body 推理，至少保证身体姿势能出来。
+            if inference_type == "full" and (
+                    "out of memory" in msg or "float and half" in msg):
+                warnings.append("手部精修失败，已退回普通推理：%s" % str(exc)[:100])
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                out = _run("body")
+            else:
+                raise
     if not out or not out[0]:
         raise HelperError("NO_POSE", "SAM 3D Body 没有检测到人物。", "换一张清晰、全身、单人的图。")
     person = out[0][0]

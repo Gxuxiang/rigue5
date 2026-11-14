@@ -112,6 +112,27 @@ POSE_MIRROR_PAIRS = [
     (15, 18), (16, 19), (17, 20),
 ] + [(i, i + 21) for i in range(21, 42)] + [(63, 64), (65, 66), (67, 68)]
 
+# MHR70 的手指顺序是「尖 → 关节1 → 关节2 → 关节3(MCP)」，拇指是
+# 「尖 → IP → MCP → CMC」。这里按 Rigify 的骨骼顺序（近端→远端）排成
+# 4 个点：p0 是第一节的起点，p1/p2/p3 是后续关节，所以：
+#   .01 方向 = p1 - p0，.02 = p2 - p1，.03 = p3 - p2。
+POSE_FINGER_CHAINS = {
+    'L': {
+        'thumb': (45, 44, 43, 42),      # CMC, MCP, IP, tip
+        'f_index': (49, 48, 47, 46),    # MCP, PIP, DIP, tip
+        'f_middle': (53, 52, 51, 50),
+        'f_ring': (57, 56, 55, 54),
+        'f_pinky': (61, 60, 59, 58),
+    },
+    'R': {
+        'thumb': (24, 23, 22, 21),
+        'f_index': (28, 27, 26, 25),
+        'f_middle': (32, 31, 30, 29),
+        'f_ring': (36, 35, 34, 33),
+        'f_pinky': (40, 39, 38, 37),
+    },
+}
+
 POSE_MARKER = 'RIGUE5_POSE_RESULT '
 POSE_COMFY_ROOT = r'D:\Comfy-Desktop\ComfyUI-Installs\ComfyUI\ComfyUI'
 POSE_DETECTION_DIR = r'D:\Comfy-Desktop\ComfyUI-Shared\models\detection'
@@ -512,6 +533,10 @@ def _pose_build_targets(rig, kp, vis, ground=True, torso_lean=True,
     scale = _pose_auto_scale(kp, vis, rest)
     H0 = rest['H0']
     warnings = []
+    # 捕捉坐标 y 向下：肩在髋下方时，说明参考图是倒立/手倒立。脚踩地的
+    # 解算没法表达倒立，提前提示比默默摆错更有用。
+    if up_cap.y > 0.35:
+        warnings.append('参考图可能是倒立/手倒立；本工具按脚踩地处理，姿势需要手动调整。')
 
     # 参考图里的人可能侧身/背身；把整个角色绕 Z 转到相同的相对朝向。
     root_yaw = 0.0
@@ -686,6 +711,38 @@ def _pose_build_targets(rig, kp, vis, ground=True, torso_lean=True,
                         @ (r_delta @ q_rest.to_matrix()).to_4x4())
             hands[S] = target_m
 
+        # 手指：只取方向（r_body 旋转到 armature 静止坐标系），不取位置。
+        # 这样即使手掌被手臂可达范围夹住，手指也不会被拉长/扭到图像里的位置。
+        fingers = {}
+        for S, wrist_i in (('L', 62), ('R', 41)):
+            if vis[wrist_i] < 0.5:
+                continue
+            chains = []
+            for fname, ids in POSE_FINGER_CHAINS.get(S, {}).items():
+                if any(vis[i] < 0.5 for i in ids):
+                    continue
+                pts = [_v3(kp[i]) for i in ids]
+                segs = [(b - a).length for a, b in zip(pts, pts[1:])]
+                # 单图 3D 的手部点有时会塌陷/乱飘；明显不合理的整根手指跳过，
+                # 不要让手指控制骨被拉成“触手”。
+                if any(s < 0.003 or s > 0.12 for s in segs):
+                    continue
+                if (pts[3] - _v3(kp[wrist_i])).length > 0.40:
+                    continue
+                dirs = []
+                for a, b in zip(pts, pts[1:]):
+                    d = b - a
+                    if d.length < 1e-4:
+                        break
+                    d = r_body @ d
+                    if d.length < 1e-6:
+                        break
+                    dirs.append(d.normalized())
+                if len(dirs) == 3:
+                    chains.append((fname, dirs))
+            if chains:
+                fingers[S] = chains
+
         feet = {}
         for S, ankle_i, toe_i, heel_i in (
                 ('L', 13, 15, 17), ('R', 14, 18, 20)):
@@ -759,6 +816,7 @@ def _pose_build_targets(rig, kp, vis, ground=True, torso_lean=True,
             'torso': torso,
             'shoulders_points': shoulder_points,
             'hands': hands,
+            'fingers': fingers,
             'feet': feet,
             'joints': joints,
             'head_rotation': head_rotation,
@@ -809,15 +867,21 @@ def _pose_prepare_ik(rig):
 
 
 def _pose_reset_bones(rig):
-    for name in ('torso', 'shoulder.L', 'shoulder.R',
-                 'neck', 'head',
-                 'hand_ik.L', 'hand_ik.R', 'foot_ik.L', 'foot_ik.R',
-                 'upper_arm_fk.L', 'upper_arm_fk.R',
-                 'forearm_fk.L', 'forearm_fk.R',
-                 'hand_fk.L', 'hand_fk.R',
-                 'thigh_fk.L', 'thigh_fk.R',
-                 'shin_fk.L', 'shin_fk.R',
-                 'foot_fk.L', 'foot_fk.R'):
+    names = ['torso', 'shoulder.L', 'shoulder.R',
+             'neck', 'head',
+             'hand_ik.L', 'hand_ik.R', 'foot_ik.L', 'foot_ik.R',
+             'upper_arm_fk.L', 'upper_arm_fk.R',
+             'forearm_fk.L', 'forearm_fk.R',
+             'hand_fk.L', 'hand_fk.R',
+             'thigh_fk.L', 'thigh_fk.R',
+             'shin_fk.L', 'shin_fk.R',
+             'foot_fk.L', 'foot_fk.R']
+    for S in ('L', 'R'):
+        for finger in ('thumb', 'f_index', 'f_middle', 'f_ring', 'f_pinky'):
+            names.append('%s.01_master.%s' % (finger, S))
+            for i in (1, 2, 3):
+                names.append('%s.0%d.%s' % (finger, i, S))
+    for name in names:
         pb = rig.pose.bones.get(name)
         if pb is not None:
             pb.matrix_basis = Matrix.Identity(4)
@@ -835,16 +899,16 @@ def _pose_prepare_fk(rig):
                 pb['IK_Stretch'] = 0.0
 
 
-def _pose_set_chain_bone(rig, name, target):
-    """把一根 FK 骨的 Y 轴转向 root->target 方向。"""
+def _pose_set_bone_direction(rig, name, direction):
+    """把一根 FK 骨的 Y 轴转到给定方向（armature 空间）。"""
     pb = rig.pose.bones.get(name)
-    if pb is None or target is None:
+    if pb is None or direction is None:
         return
-    root = pb.matrix.to_translation()
-    direction = target - root
+    direction = Vector(direction)
     if direction.length < 1e-6:
         return
     direction.normalize()
+    root = pb.matrix.to_translation()
     rest_q = pb.bone.matrix_local.to_quaternion()
     rest_y = rest_q @ Vector((0.0, 1.0, 0.0))
     rest_y.normalize()
@@ -852,6 +916,25 @@ def _pose_set_chain_bone(rig, name, target):
     _pose_set_bone_matrix(
         rig, name,
         Matrix.Translation(root) @ (q @ rest_q).to_matrix().to_4x4())
+
+
+def _pose_set_chain_bone(rig, name, target):
+    """把一根 FK 骨的 Y 轴转向 root->target 方向。"""
+    pb = rig.pose.bones.get(name)
+    if pb is None or target is None:
+        return
+    _pose_set_bone_direction(rig, name, target - pb.matrix.to_translation())
+
+
+def _pose_apply_fingers(rig, targets, side=None):
+    """手指控制是 FK 链：按近端→远端逐节把 Y 轴对到参考方向。"""
+    fingers = targets.get('fingers') or {}
+    for S in ((side,) if side else ('L', 'R')):
+        for fname, dirs in fingers.get(S, []):
+            for i, d in enumerate(dirs, 1):
+                _pose_set_bone_direction(
+                    rig, '%s.0%d.%s' % (fname, i, S), d)
+                bpy.context.view_layer.update()
 
 
 def _pose_apply_torso_head(rig, targets):
@@ -911,6 +994,7 @@ def _pose_apply(rig, targets):
         if S in targets['feet']:
             _pose_set_bone_matrix(rig, 'foot_ik.' + S, targets['feet'][S])
     bpy.context.view_layer.update()
+    _pose_apply_fingers(rig, targets)
     _pose_apply_root_yaw(rig, targets)
     return targets
 
@@ -955,6 +1039,7 @@ def _pose_apply_fk(rig, targets, ground=True):
                 rig, 'hand_fk.' + S,
                 Matrix.Translation(pos) @ hand.to_quaternion().to_matrix().to_4x4())
             bpy.context.view_layer.update()
+            _pose_apply_fingers(rig, targets, side=S)
 
         _pose_set_chain_bone(rig, 'thigh_fk.' + S,
                              joints.get('knee_' + S))
@@ -1007,6 +1092,8 @@ def _pose_apply_payload(rig, payload, scene):
         torso_lean=bool(getattr(scene, 'character_pose_torso', True)),
         head_turn=bool(getattr(scene, 'character_pose_head', True)),
         face_reference=bool(getattr(scene, 'character_pose_facing', True)))
+    if not getattr(scene, 'character_pose_fingers', True):
+        targets['fingers'] = {}
     if getattr(scene, 'character_pose_limbs', 'fk') == 'ik':
         _pose_apply(rig, targets)
     else:
@@ -1273,6 +1360,7 @@ def _pose_start_job(context, mode, image_path=''):
         'image_path': image_path,
         'model_dir': POSE_LOCAL_MODELS,
         'comfy_root': _pose_comfy_root(scene),
+        'refine_hands': bool(getattr(scene, 'character_pose_fingers', True)),
         'save_capture': mode in ('clipboard', 'screenshot'),
         'capture_dir': os.path.join(POSE_LOCAL_ROOT, 'captures'),
     }
@@ -1936,6 +2024,8 @@ class VIEW3D_PT_character_tools(bpy.types.Panel):
         row3 = pcol.row(align=True)
         row3.prop(scene, 'character_pose_facing', text='匹配朝向')
         row3.prop(scene, 'character_pose_limbs', text='四肢')
+        row4 = pcol.row(align=True)
+        row4.prop(scene, 'character_pose_fingers', text='手指')
         if scene.character_pose_message:
             box.label(text=scene.character_pose_message, icon='INFO')
         if scene.character_pose_stage:
@@ -2000,6 +2090,10 @@ def register():
         name='头/颈转向', default=True)
     bpy.types.Scene.character_pose_facing = bpy.props.BoolProperty(
         name='匹配朝向', default=True)
+    bpy.types.Scene.character_pose_fingers = bpy.props.BoolProperty(
+        name='手指',
+        description='用 MHR70 的手部关键点摆手指（SAM 3D Body 会顺手部精修）',
+        default=True)
     bpy.types.Scene.character_pose_limbs = bpy.props.EnumProperty(
         name='四肢',
         description='FK：肘/膝更贴近参考；IK：手/脚落点更精确',
@@ -2031,6 +2125,7 @@ def unregister():
                  'character_pose_depth', 'character_pose_mirror',
                  'character_pose_torso', 'character_pose_head',
                  'character_pose_facing', 'character_pose_limbs',
+                 'character_pose_fingers',
                  'character_pose_message', 'character_pose_stage',
                  'character_pose_progress', 'character_pose_env_report',
                  'character_pose_comfy_python', 'character_pose_sys_python',
