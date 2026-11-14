@@ -387,6 +387,8 @@ def _pose_rest_metrics(rig):
         'torso_rest': rig.pose.bones['torso'].bone.matrix_local.copy(),
         'hand_rest': {},
         'hand_frame': {},
+        'finger_roll': {},
+        'forearm_roll': {},
         'foot_rest': {},
     }
     # 静止身体坐标系（A-pose 本身有轻微前倾，不能强行对齐到世界 Z）
@@ -440,6 +442,28 @@ def _pose_rest_metrics(rig):
                 Vector((0.0, -1.0, 0.0)),
                 Vector((1.0, 0.0, 0.0)),
                 Vector((0.0, 0.0, 1.0)))
+
+        # 手指/前臂的 roll：记下它们静止时 local X 在“手掌坐标系”里的分量。
+        # 摆姿势时用同一个分量重建 local X，手指就不会绕自身轴乱滚。
+        F = rest['hand_frame'][S]
+
+        def roll_coef(bone_name):
+            b = bones.get(bone_name)
+            if b is None:
+                return None
+            x = b.matrix_local.to_3x3().col[0]
+            return Vector((x.dot(F.col[0]), x.dot(F.col[1]), x.dot(F.col[2])))
+
+        rolls = {}
+        for finger in ('thumb', 'f_index', 'f_middle', 'f_ring', 'f_pinky'):
+            for i in (1, 2, 3):
+                name = '%s.0%d.%s' % (finger, i, S)
+                coef = roll_coef(name)
+                if coef is not None:
+                    rolls[name] = coef
+        rest['finger_roll'][S] = rolls
+        rest['forearm_roll'][S] = roll_coef('DEF-forearm.' + S) or roll_coef('forearm_fk.' + S)
+
         ankle = head('DEF-foot.' + S)
         toe = tail('DEF-toe.' + S)
         heel = ankle + Vector((0.0, 0.06, -0.075))
@@ -658,6 +682,7 @@ def _pose_build_targets(rig, kp, vis, ground=True, torso_lean=True,
             shoulder_points[S] = to_rig(_v3(kp[idx]), shift)
 
         hands = {}
+        hand_frames = {}
         for S, wrist_i, middle_i, index_i, pinky_i, thumb_i in (
                 ('L', 62, 53, 49, 61, 42), ('R', 41, 32, 28, 40, 21)):
             if vis[wrist_i] < 0.5:
@@ -697,6 +722,7 @@ def _pose_build_targets(rig, kp, vis, ground=True, torso_lean=True,
             n.normalize()
             # 手骨的 Y 是腕->中指根，Z 是食指->小指方向；所以列为 [X=n, Y=f, Z=l]
             f_cap = _pose_frame(n, f, l)
+            hand_frames[S] = r_body @ f_cap
 
             target = to_rig(wrist, shift)
             target = _pose_clamp_reach(shoulder_points[S], target,
@@ -729,17 +755,39 @@ def _pose_build_targets(rig, kp, vis, ground=True, torso_lean=True,
                     continue
                 if (pts[3] - _v3(kp[wrist_i])).length > 0.40:
                     continue
-                dirs = []
-                for a, b in zip(pts, pts[1:]):
+                F_t = hand_frames.get(S)
+                if F_t is None:
+                    continue
+                frames = []
+                for i, (a, b) in enumerate(zip(pts, pts[1:]), 1):
                     d = b - a
                     if d.length < 1e-4:
                         break
-                    d = r_body @ d
-                    if d.length < 1e-6:
+                    y = r_body @ d
+                    if y.length < 1e-6:
                         break
-                    dirs.append(d.normalized())
-                if len(dirs) == 3:
-                    chains.append((fname, dirs))
+                    y.normalize()
+                    bone_name = '%s.0%d.%s' % (fname, i, S)
+                    coef = rest['finger_roll'].get(S, {}).get(bone_name)
+                    if coef is None:
+                        break
+                    # 参考手掌坐标系里的 roll：x = F_t @ coef，再投影到指节方向。
+                    # 只设 Y 方向（rotation_difference）会让手指绕自身轴乱滚。
+                    x = F_t @ coef
+                    x = x - y * x.dot(y)
+                    if x.length < 0.05:
+                        alt = F_t.col[0]
+                        x = alt - y * alt.dot(y)
+                    if x.length < 1e-4:
+                        break
+                    x.normalize()
+                    z = x.cross(y)
+                    R = Matrix(((x.x, y.x, z.x),
+                                (x.y, y.y, z.y),
+                                (x.z, y.z, z.z)))
+                    frames.append((bone_name, R))
+                if len(frames) == 3:
+                    chains.append((fname, frames))
             if chains:
                 fingers[S] = chains
 
@@ -816,7 +864,12 @@ def _pose_build_targets(rig, kp, vis, ground=True, torso_lean=True,
             'torso': torso,
             'shoulders_points': shoulder_points,
             'hands': hands,
+            'hand_frames': hand_frames,
             'fingers': fingers,
+            'forearm_refs': {
+                S: hand_frames[S] @ rest['forearm_roll'][S]
+                for S in hand_frames
+                if rest['forearm_roll'].get(S) is not None},
             'feet': feet,
             'joints': joints,
             'head_rotation': head_rotation,
@@ -868,6 +921,7 @@ def _pose_prepare_ik(rig):
 
 def _pose_reset_bones(rig):
     names = ['torso', 'shoulder.L', 'shoulder.R',
+             'spine_fk', 'spine_fk.001', 'spine_fk.002', 'spine_fk.003',
              'neck', 'head',
              'hand_ik.L', 'hand_ik.R', 'foot_ik.L', 'foot_ik.R',
              'upper_arm_fk.L', 'upper_arm_fk.R',
@@ -918,6 +972,16 @@ def _pose_set_bone_direction(rig, name, direction):
         Matrix.Translation(root) @ (q @ rest_q).to_matrix().to_4x4())
 
 
+def _pose_set_bone_frame(rig, name, rot):
+    """把一根 FK 骨设成给定的 3x3 世界朝向（保留当前位置）。"""
+    pb = rig.pose.bones.get(name)
+    if pb is None or rot is None:
+        return
+    pos = pb.matrix.to_translation()
+    _pose_set_bone_matrix(
+        rig, name, Matrix.Translation(pos) @ rot.to_4x4())
+
+
 def _pose_set_chain_bone(rig, name, target):
     """把一根 FK 骨的 Y 轴转向 root->target 方向。"""
     pb = rig.pose.bones.get(name)
@@ -926,20 +990,78 @@ def _pose_set_chain_bone(rig, name, target):
     _pose_set_bone_direction(rig, name, target - pb.matrix.to_translation())
 
 
+def _pose_set_chain_bone_roll(rig, name, target, roll_ref):
+    """Y 轴指向 target，同时用 roll_ref 决定绕 Y 的滚转。"""
+    pb = rig.pose.bones.get(name)
+    if pb is None:
+        return
+    if target is None or roll_ref is None:
+        _pose_set_chain_bone(rig, name, target)
+        return
+    y = target - pb.matrix.to_translation()
+    if y.length < 1e-6:
+        return
+    y.normalize()
+    x = roll_ref - y * roll_ref.dot(y)
+    if x.length < 1e-4:
+        _pose_set_chain_bone(rig, name, target)
+        return
+    x.normalize()
+    z = x.cross(y)
+    R = Matrix(((x.x, y.x, z.x),
+                (x.y, y.y, z.y),
+                (x.z, y.z, z.z)))
+    _pose_set_bone_frame(rig, name, R)
+
+
 def _pose_apply_fingers(rig, targets, side=None):
-    """手指控制是 FK 链：按近端→远端逐节把 Y 轴对到参考方向。"""
+    """手指控制是 FK 链：按近端→远端逐节套完整朝向（含 roll）。"""
     fingers = targets.get('fingers') or {}
     for S in ((side,) if side else ('L', 'R')):
-        for fname, dirs in fingers.get(S, []):
-            for i, d in enumerate(dirs, 1):
-                _pose_set_bone_direction(
-                    rig, '%s.0%d.%s' % (fname, i, S), d)
+        for _fname, frames in fingers.get(S, []):
+            for bone_name, rot in frames:
+                _pose_set_bone_frame(rig, bone_name, rot)
                 bpy.context.view_layer.update()
 
 
 def _pose_apply_torso_head(rig, targets):
     _pose_set_bone_matrix(rig, 'torso', targets['torso'])
     bpy.context.view_layer.update()
+
+    # torso 是刚性主控，而参考图只有肩/髋两组点。先把“肩中心 -> 目标肩中心”
+    # 的偏差分摊到脊椎 FK 上，让胸腔先弯过去；剩下的再由 shoulder 控制小范围
+    # 平移修正。否则大侧弯时肩膀要硬拉十几厘米，网格会拉出尖角。
+    pivots = {}
+    for S in ('L', 'R'):
+        pb = (rig.pose.bones.get('MCH-upper_arm_parent.' + S)
+              or rig.pose.bones.get('upper_arm_ik.' + S))
+        if pb is not None:
+            pivots[S] = pb.matrix.to_translation()
+    sp = targets.get('shoulders_points') or {}
+    if len(pivots) == 2 and sp.get('L') is not None and sp.get('R') is not None:
+        base_pb = rig.pose.bones.get('spine_fk.001')
+        if base_pb is not None:
+            cur = (pivots['L'] + pivots['R']) * 0.5
+            tgt = (sp['L'] + sp['R']) * 0.5
+            base = base_pb.matrix.to_translation()
+            vc = cur - base
+            vt = tgt - base
+            if vc.length > 1e-4 and vt.length > 1e-4:
+                q = vc.normalized().rotation_difference(vt.normalized())
+                ang = min(abs(q.angle), math.radians(50.0))
+                if ang > math.radians(3.0):
+                    for name in ('spine_fk.001', 'spine_fk.002',
+                                 'spine_fk.003'):
+                        pb = rig.pose.bones.get(name)
+                        if pb is None:
+                            continue
+                        inc = Quaternion(q.axis, ang / 3.0).to_matrix()
+                        rot = inc @ pb.matrix.to_quaternion().to_matrix()
+                        _pose_set_bone_matrix(
+                            rig, name,
+                            Matrix.Translation(pb.matrix.to_translation())
+                            @ rot.to_4x4())
+                        bpy.context.view_layer.update()
 
     for S in ('L', 'R'):
         pb = rig.pose.bones.get('shoulder.' + S)
@@ -955,8 +1077,10 @@ def _pose_apply_torso_head(rig, targets):
             continue
         current = pb.matrix.copy()
         delta = target - pivot_pb.matrix.to_translation()
-        if delta.length > 0.08:
-            delta = delta.normalized() * 0.08
+        if delta.length > 0.10:
+            targets.setdefault('warnings', []).append(
+                '肩部位置修正超过 10 cm，已截断：%s（%.2f m）' % (S, delta.length))
+            delta = delta.normalized() * 0.10
         _pose_set_bone_matrix(rig, 'shoulder.' + S,
                               Matrix.Translation(delta) @ current)
     bpy.context.view_layer.update()
@@ -1028,8 +1152,10 @@ def _pose_apply_fk(rig, targets, ground=True):
         _pose_set_chain_bone(rig, 'upper_arm_fk.' + S,
                              joints.get('elbow_' + S))
         bpy.context.view_layer.update()
-        _pose_set_chain_bone(rig, 'forearm_fk.' + S,
-                             joints.get('wrist_' + S))
+        # 前臂的滚转跟随手掌坐标系的“手背方向”，否则手腕/前臂网格会拧。
+        _pose_set_chain_bone_roll(
+            rig, 'forearm_fk.' + S, joints.get('wrist_' + S),
+            (targets.get('forearm_refs') or {}).get(S))
         bpy.context.view_layer.update()
         hand = targets['hands'].get(S)
         pbh = rig.pose.bones.get('hand_fk.' + S)
