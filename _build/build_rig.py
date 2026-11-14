@@ -241,22 +241,25 @@ for ue_bone, entries in sorted(rt.items()):
         e.parent_bone = rg_bone
         pending.append((e, ue_bone, rg_bone, inf))
 
-# Carry the pelvis displacement in rig space. Bone parenting an offset at the
-# origin would rotate that offset around the pelvis and slide the whole mesh.
-root_empty = bpy.data.objects.new('RTG_root__DEF-spine', None)
-coll.objects.link(root_empty)
-root_empty.empty_display_type = 'PLAIN_AXES'
-root_empty.empty_display_size = 0.05
-root_empty.hide_render = True
-root_empty.parent = rig
-root_empty.location = -rig.data.bones['DEF-spine'].head_local
-root_location = root_empty.constraints.new('COPY_LOCATION')
-root_location.target = rig
-root_location.subtarget = 'DEF-spine'
-root_location.owner_space = 'LOCAL'
-root_location.target_space = 'POSE'
-root_location.use_offset = True
-root_empty.hide_set(True)
+# Root motion: rig:root (the big circle at the feet) drives the armature
+# object's location *and* rotation.  This helper mirrors the root bone's pose
+# matrix: at rest it is the identity, so the UE object (whose rest transform is
+# the 0.01-scaled identity) rides exactly on rig:root.  A root yaw therefore
+# ends up on the exported root node - that is UE root motion - instead of in
+# the pelvis rotation.
+root_helper = bpy.data.objects.new('RTG_root__root', None)
+coll.objects.link(root_helper)
+root_helper.empty_display_type = 'PLAIN_AXES'
+root_helper.empty_display_size = 0.05
+root_helper.hide_render = True
+root_helper.parent = rig
+root_helper.parent_type = 'BONE'
+root_helper.parent_bone = 'root'
+bpy.context.view_layer.update()
+root_pb = rig.pose.bones['root']
+P = rig.matrix_world @ root_pb.matrix @ Matrix.Translation((0, root_pb.bone.length, 0))
+root_helper.matrix_basis = P.inverted() @ Matrix.Identity(4)
+root_helper.hide_set(True)
 
 bpy.context.view_layer.update()
 
@@ -305,25 +308,47 @@ for e, ue_bone, rg_bone, inf in pending:
     c.influence = inf
     added += 1
 
-# root motion: the armature object itself rides on DEF-spine (the rig's body
-# motion), and the pelvis keeps only its rotation - exactly like the FBX that
-# UE produces for a root-motion animation
+# root motion: the armature object itself rides on rig:root - location *and*
+# rotation - exactly like the FBX that UE produces for a root-motion animation
 for c in list(ue.constraints):
     if c.name.startswith('RTG-'):
         ue.constraints.remove(c)
 cl = ue.constraints.new('COPY_LOCATION')
 cl.name = 'RTG-loc:root'
-cl.target = root_empty
+cl.target = root_helper
 cl.owner_space = 'WORLD'
 cl.target_space = 'WORLD'
 cl.use_offset = False
 cl.head_tail = 0.0
 
-# the pelvis must not copy the translation any more (the object carries it)
+cr = ue.constraints.new('COPY_ROTATION')
+cr.name = 'RTG-rot:root'
+cr.target = root_helper
+cr.owner_space = 'WORLD'
+cr.target_space = 'WORLD'
+cr.mix_mode = 'REPLACE'
+cr.use_offset = False
+cr.influence = 1.0
+
+# The pelvis no longer carries the root motion, but it still has to follow the
+# hip position (torso translation, crouches) as a *bone* track.  The pelvis
+# rotation helper sits exactly on DEF-spine's head, so it is also the right
+# position target.  (Targeting the rig bone directly would leave the baked-clean
+# path depending on the rig.)
 pb = ue.pose.bones['pelvis']
 for c in list(pb.constraints):
     if c.name.startswith('RTG-loc'):
         pb.constraints.remove(c)
+pelvis_helper = next((e for e, ue_bone, rg_bone, inf in pending
+                      if ue_bone == 'pelvis' and rg_bone == 'DEF-spine'), None)
+if pelvis_helper is not None:
+    cl = pb.constraints.new('COPY_LOCATION')
+    cl.name = 'RTG-loc:DEF-spine'
+    cl.target = pelvis_helper
+    cl.owner_space = 'WORLD'
+    cl.target_space = 'WORLD'
+    cl.use_offset = False
+    cl.head_tail = 0.0
 
 # The Manny's clavicles hang off spine_05, which now follows the rig's neck
 # base: pin their position to the rig's shoulder so turning the neck does not
