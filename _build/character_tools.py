@@ -389,7 +389,6 @@ def _pose_rest_metrics(rig):
         'rest_thigh': (hip_l - head('DEF-shin.L')).length,
         'rest_shin': (head('DEF-shin.L') - head('DEF-foot.L')).length,
         'rest_torso': ((sh_l + sh_r) * 0.5 - (hip_l + hip_r) * 0.5).length,
-        'rest_ankle_z': head('DEF-foot.L').z,
         'torso_rest': rig.pose.bones['torso'].bone.matrix_local.copy(),
         'hand_rest': {},
         'hand_frame': {},
@@ -408,19 +407,18 @@ def _pose_rest_metrics(rig):
     l0 = u0.cross(f0)
     l0.normalize()
     rest['body_frame'] = _pose_frame(f0, l0, u0)
-    # 髋部参考坐标系（髋线 + 世界 Z）。只用髋线判断左右，不把腿的弯曲
-    # 带进躯干倾斜的计算。
-    u_h = Vector((0.0, 0.0, 1.0))
-    l_h = hip_l - hip_r
-    l_h = l_h - u_h * l_h.dot(u_h)
-    if l_h.length < 1e-6:
-        l_h = Vector((1.0, 0.0, 0.0))
-    l_h.normalize()
-    f_h = l_h.cross(u_h)
-    f_h.normalize()
-    l_h = u_h.cross(f_h)
-    l_h.normalize()
-    rest['hip_frame'] = _pose_frame(f_h, l_h, u_h)
+    # 静止骨盆坐标系：髋线 + 世界 Z（Manny 的骨盆是竖直的）
+    u_p = Vector((0.0, 0.0, 1.0))
+    l_p = hip_l - hip_r
+    l_p = l_p - u_p * l_p.dot(u_p)
+    if l_p.length < 1e-6:
+        l_p = Vector((1.0, 0.0, 0.0))
+    l_p.normalize()
+    f_p = l_p.cross(u_p)
+    f_p.normalize()
+    l_p = u_p.cross(f_p)
+    l_p.normalize()
+    rest['pelvis_frame'] = _pose_frame(f_p, l_p, u_p)
 
     for S in ('L', 'R'):
         wrist = head('DEF-hand.' + S)
@@ -485,7 +483,12 @@ def _pose_rest_metrics(rig):
     return rest
 
 
-def _pose_body_frame(kp, vis, rest):
+def _pose_capture_frame(kp, vis):
+    """捕捉空间里的胸廓坐标系（f 前 / l 左 / u 上），外加髋中心。
+
+    这里只描述“参考里的身体朝哪儿”，不做任何抵消；映射到角色时统一用
+    固定的坐标轴换算，躺姿/倒立/弯腰都由关键点自身决定。
+    """
     def ok(i):
         return 0 <= i < len(vis) and vis[i] >= 0.5
 
@@ -510,12 +513,58 @@ def _pose_body_frame(kp, vis, rest):
     f.normalize()
     l = u.cross(f)
     l.normalize()
-    f_cap = _pose_frame(f, l, u)
-    # 相对“静止身体坐标系”求旋转；静止时 R_body == I。
-    r_body = rest['body_frame'] @ f_cap.transposed()
-    if r_body.determinant() < 0.0:
-        raise RuntimeError('姿态坐标系是左手系，无法转换。')
-    return r_body, hip_mid, u
+    return _pose_frame(f, l, u), hip_mid, u
+
+
+def _pose_pelvis_frame(kp, vis, up_body):
+    """捕捉空间里的骨盆坐标系：髋线定左右，“上”在世界上和身体上之间过渡。
+
+    直立时用图像垂直方向（= 世界上），所以骨盆只跟着髋线转，弯腰的部分全部
+    留给脊椎；身体越接近水平/倒立，骨盆越跟着身体走，避免脊椎被硬掰成 90°。
+    髋线 + 身体上 在侧躺时会退化，这时退回世界上。
+    """
+    l = _v3(kp[9]) - _v3(kp[10])
+    up_world = Vector((0.0, -1.0, 0.0))
+    if up_body is None or up_body.length < 1e-6:
+        u = up_world.copy()
+    else:
+        up_body = up_body.normalized()
+        tilt = math.degrees(up_body.angle(up_world))
+        t = max(0.0, min(1.0, (tilt - 40.0) / 40.0))
+        u = up_world.lerp(up_body, t)
+    u = u - l * u.dot(l)
+    if u.length < 1e-5:
+        u = up_world - l * up_world.dot(l)
+    if u.length < 1e-5:
+        u = Vector((0.0, 0.0, 1.0))
+    u.normalize()
+    l = l - u * l.dot(u)
+    if l.length < 1e-6:
+        raise RuntimeError('左右髋重合，无法确定骨盆方向。')
+    l.normalize()
+    f = l.cross(u)
+    f.normalize()
+    l = u.cross(f)
+    l.normalize()
+    return _pose_frame(f, l, u)
+
+
+def _pose_facing_yaw(kp, vis):
+    """参考图正面朝向相对镜头的 yaw（0 = 正对镜头，正值 = 转向镜头右侧）。"""
+    P = _v3
+    u_face = (P(kp[5]) + P(kp[6])) * 0.5 - (P(kp[9]) + P(kp[10])) * 0.5
+    if u_face.length < 1e-6:
+        return 0.0
+    u_face.normalize()
+    l_face = P(kp[5]) - P(kp[6])
+    l_face = l_face - u_face * l_face.dot(u_face)
+    if l_face.length < 1e-6:
+        return 0.0
+    l_face.normalize()
+    f_face = l_face.cross(u_face)
+    if f_face.length < 1e-6:
+        return 0.0
+    return math.atan2(f_face.x, -f_face.z)
 
 
 def _pose_auto_scale(kp, vis, rest):
@@ -559,41 +608,46 @@ def _pose_clamp_reach(pivot, target, max_len):
 def _pose_build_targets(rig, kp, vis, ground=True, torso_lean=True,
                         head_turn=True, face_reference=True):
     rest = _pose_rest_metrics(rig)
-    r_body, hip_cap, up_cap = _pose_body_frame(kp, vis, rest)
+    f_cap, hip_cap, up_cap = _pose_capture_frame(kp, vis)
     scale = _pose_auto_scale(kp, vis, rest)
     H0 = rest['H0']
     warnings = []
-    # 身体 up 与图像 up 的夹角。直立时约 0°，躺姿约 90°，倒立约 180°。
-    # 夹角大时不再假设“脚踩地 + 脊柱竖直”，而是把整个角色按参考朝向
-    # 全局旋转（root），再按网格最低点贴地。
-    tilt = math.degrees(up_cap.angle(Vector((0.0, -1.0, 0.0))))
-    global_root = False
-    root_rotation = None
-    if tilt > 60.0:
-        rg = POSE_CAP_TO_WORLD @ r_body.transposed()
-        if rg.determinant() > 0.0:
-            global_root = True
-            root_rotation = rg
+
+    # 捕捉空间 -> 角色空间。相机是竖直的，所以这里只做坐标轴换算：参考图里的
+    # 人是站着、弯腰、躺着还是倒立，完全由关键点本身决定。旧版拿“肩-髋轴”去
+    # 抵消身体朝向再靠 root 转回来，会把弯腰/侧倾/躺姿拉直、四肢位置跟着偏，
+    # 而且必须写 root（污染根运动）。
+    C = POSE_CAP_TO_WORLD
+    root_yaw = _pose_facing_yaw(kp, vis)
+    # 匹配朝向：默认和参考一致（C 本身已经把镜头里的朝向带过来）；关掉时把
+    # 参考朝向转回角色默认朝向（-Y），姿势本身不变。
+    yaw = 0.0 if face_reference else -root_yaw
+    R = Matrix.Rotation(yaw, 3, 'Z') @ C
+
+    # 躯干朝向拆成两段：骨盆（torso 控制）和“胸廓相对骨盆”（脊椎 FK）。
+    # 直立/弯腰时骨盆按“髋线 + 世界上”只吃很小的角度，剩下的都交给脊椎弯，
+    # 所以弯腰是“脊椎在弯”，不是整个人从胯部倒下去；躺/倒立时骨盆跟着身体走
+    # （见 _pose_pelvis_frame 的过渡），脊椎不再硬弯。
+    pelvis_cap = _pose_pelvis_frame(kp, vis, up_cap)
+    chest_delta = Matrix.Identity(3)
+    pelvis_delta = Matrix.Identity(3)
+    spine_delta = Matrix.Identity(3)
+    if torso_lean:
+        chest_delta = (R @ f_cap) @ rest['body_frame'].transposed()
+        if chest_delta.determinant() > 0.0:
+            if abs(chest_delta.to_quaternion().angle) < math.radians(2.0):
+                chest_delta = Matrix.Identity(3)
+            else:
+                pelvis_delta = (R @ pelvis_cap) @ rest['pelvis_frame'].transposed()
+                if pelvis_delta.determinant() <= 0.0:
+                    pelvis_delta = Matrix.Identity(3)
+                spine_delta = chest_delta @ pelvis_delta.transposed()
         else:
-            warnings.append('检测到倒立/躺姿，但身体坐标系是左手系，已按脚踩地处理。')
+            chest_delta = Matrix.Identity(3)
 
-    # 参考图里的人可能侧身/背身；把整个角色绕 Z 转到相同的相对朝向。
-    root_yaw = 0.0
-    if face_reference:
-        u_face = ((_v3(kp[5]) + _v3(kp[6])) * 0.5
-                  - (_v3(kp[9]) + _v3(kp[10])) * 0.5)
-        if u_face.length > 1e-6:
-            u_face.normalize()
-            l_face = _v3(kp[5]) - _v3(kp[6])
-            l_face = l_face - u_face * l_face.dot(u_face)
-            if l_face.length > 1e-6:
-                l_face.normalize()
-                f_face = l_face.cross(u_face)
-                if f_face.length > 1e-6:
-                    f_face.normalize()
-                    root_yaw = math.atan2(f_face.x, -f_face.z)
-
-    # 头/颈朝向：鼻子 + 左右耳构造头部坐标系，映射到 armature 后套到控制骨。
+    # 头/颈朝向：鼻子 + 左右耳构造头部坐标系，求“从角色静止头朝向到参考头朝向”
+    # 的完整旋转（含 yaw/pitch/roll）。旧版只取 yaw + 半个 pitch，躺姿/倒立时
+    # 头会留在正上方；现在头会跟着身体翻过去，只限制“相对躯干”的转角。
     head_rotation = None
     neck_rotation = None
     if head_turn and vis[0] >= 0.5 and vis[3] >= 0.5 and vis[4] >= 0.5:
@@ -611,84 +665,39 @@ def _pose_build_targets(rig, kp, vis, ground=True, torso_lean=True,
                 u_head = f_head.cross(l_head)
                 if u_head.length > 1e-6:
                     u_head.normalize()
-                    f_arm = r_body @ f_head
-                    if f_arm.length > 1e-6:
-                        f_arm.normalize()
-                        # 只取“转头(yaw)”和少量“抬头/低头(pitch)”，不做 roll；
-                        # 避免鼻子/耳朵的 3D 噪声把整个头拧歪。
-                        yaw = math.atan2(f_arm.x, -f_arm.y)
-                        pitch = math.asin(max(-1.0, min(1.0, f_arm.z)))
-                        yaw = max(-math.radians(60.0),
-                                  min(math.radians(60.0), yaw))
-                        pitch = max(-math.radians(25.0),
-                                    min(math.radians(25.0), pitch))
-                        q_head_rest = rig.data.bones['head'].matrix_local.to_quaternion()
-                        q_neck_rest = rig.data.bones['neck'].matrix_local.to_quaternion()
-                        q_yaw = Quaternion((0.0, 0.0, 1.0), yaw)
-                        q_pitch = Quaternion((1.0, 0.0, 0.0), -pitch * 0.5)
-                        q_target = q_yaw @ q_pitch @ q_head_rest
-                        head_rotation = q_target
-                        neck_rotation = q_neck_rest.slerp(q_target, 0.35)
+                    l_head = u_head.cross(f_head)
+                    l_head.normalize()
+                    f_head = l_head.cross(u_head)
+                    f_head.normalize()
+                    f_head_cap = _pose_frame(f_head, l_head, u_head)
+                    # 头骨静止时“鼻子朝 -Y、左耳朝 +X、头顶朝 +Z”，求从头骨静止
+                    # 朝向到参考头部朝向的完整旋转（含 yaw/pitch/roll）。
+                    # 这样倒立/躺姿时头也会跟着翻过去，而不是只取 yaw/pitch。
+                    f_head_rest = _pose_frame(Vector((0.0, -1.0, 0.0)),
+                                              Vector((1.0, 0.0, 0.0)),
+                                              Vector((0.0, 0.0, 1.0)))
+                    q_delta = (R @ f_head_cap @ f_head_rest.transposed()).to_quaternion()
+                    q_body = chest_delta.to_quaternion()
+                    # 只限制“头相对躯干”的转角（脖子转不到 100°），身体的整体
+                    # 朝向（弯腰/躺/倒立）原样通过，倒立时头才不会留在正上方。
+                    q_extra = q_body.inverted() @ q_delta
+                    if q_extra.angle > math.radians(60.0):
+                        q_extra = Quaternion(q_extra.axis, math.radians(60.0))
+                    q_delta = q_body @ q_extra
+                    q_head_rest = rig.data.bones['head'].matrix_local.to_quaternion()
+                    q_neck_rest = rig.data.bones['neck'].matrix_local.to_quaternion()
+                    head_rotation = q_delta @ q_head_rest
+                    # 脖子：跟上躯干，再吃 35% 的转头量。
+                    q_neck_delta = q_body @ Quaternion(
+                        q_extra.axis, q_extra.angle * 0.35)
+                    neck_rotation = q_neck_delta @ q_neck_rest
 
     def to_rig(p, shift):
-        return H0 + shift + (r_body @ (p - hip_cap)) * scale
+        return H0 + shift + (R @ (p - hip_cap)) * scale
 
     def build(shift):
-        # 躯干倾斜：在 capture 空间用“髋线 + 图像垂直方向”做全局参考，
-        # 再把肩部姿态映射到 armature。位置映射仍用 R_body，所以四肢
-        # 位置不受躯干旋转影响；腿弯也不会被误当成躯干前倾。
-        u_cap = Vector((0.0, -1.0, 0.0))
-        l_cap = _v3(kp[9]) - _v3(kp[10])
-        l_cap = l_cap - u_cap * l_cap.dot(u_cap)
-        if l_cap.length < 1e-6:
-            l_cap = _v3(kp[5]) - _v3(kp[6])
-            l_cap = l_cap - u_cap * l_cap.dot(u_cap)
-        if l_cap.length < 1e-6:
-            l_cap = Vector((1.0, 0.0, 0.0))
-        l_cap.normalize()
-        f_cap = l_cap.cross(u_cap)
-        f_cap.normalize()
-        l_cap = u_cap.cross(f_cap)
-        l_cap.normalize()
-        f_hip_cap = _pose_frame(f_cap, l_cap, u_cap)
-        r_global = rest['hip_frame'] @ f_hip_cap.transposed()
-
-        sh_mid_cap = (_v3(kp[5]) + _v3(kp[6])) * 0.5
-        hip_mid_cap = (_v3(kp[9]) + _v3(kp[10])) * 0.5
-        u_s = sh_mid_cap - hip_mid_cap
-        if u_s.length < 1e-6:
-            u_s = u_cap
-        u_s.normalize()
-        l_s = _v3(kp[5]) - _v3(kp[6])
-        l_s = l_s - u_s * l_s.dot(u_s)
-        if l_s.length < 1e-6:
-            l_s = l_cap
-        l_s.normalize()
-        f_s = l_s.cross(u_s)
-        f_s.normalize()
-        l_s = u_s.cross(f_s)
-        l_s.normalize()
-        f_sh_cap = _pose_frame(f_s, l_s, u_s)
-
-        if torso_lean and not global_root:
-            f_sh_arm = r_global @ f_sh_cap
-            r_delta = f_sh_arm @ rest['body_frame'].transposed()
-            if r_delta.determinant() < 0.0:
-                r_delta = Matrix.Identity(3)
-            # 死区 + 缩放：单图 3D 深度噪声会让躯干“总是前倾”，12° 以内忽略；
-            # 真弯腰时再按比例应用，最多 35°。
-            q_delta = r_delta.to_quaternion()
-            ang = abs(q_delta.angle)
-            if ang < math.radians(8.0):
-                r_delta = Matrix.Identity(3)
-            else:
-                applied = min(math.radians(35.0),
-                              (ang - math.radians(8.0)) * 0.9)
-                r_delta = Quaternion(q_delta.axis, applied).to_matrix()
-        else:
-            r_delta = Matrix.Identity(3)
         torso = (Matrix.Translation(H0 + shift)
-                 @ r_delta.to_4x4()
+                 @ pelvis_delta.to_4x4()
                  @ Matrix.Translation(-H0)
                  @ rest['torso_rest'])
 
@@ -715,7 +724,7 @@ def _pose_build_targets(rig, kp, vis, ground=True, torso_lean=True,
             if f.length < 1e-4:
                 f = thumb - wrist
             if f.length < 1e-4:
-                f = r_body.transposed() @ Vector((0.0, -1.0, 0.0))
+                f = R.transposed() @ Vector((0.0, -1.0, 0.0))
             if f.length < 1e-6:
                 warnings.append('手部方向无法确定：%s' % S)
                 continue
@@ -727,7 +736,7 @@ def _pose_build_targets(rig, kp, vis, ground=True, torso_lean=True,
                 l = thumb - wrist
                 l = l - f * l.dot(f)
             if l.length < 1e-4:
-                l = f.cross(r_body.transposed() @ Vector((0.0, 0.0, 1.0)))
+                l = f.cross(R.transposed() @ Vector((0.0, 0.0, 1.0)))
                 l = l - f * l.dot(f)
             if l.length < 1e-6:
                 warnings.append('手掌朝向无法确定：%s' % S)
@@ -737,7 +746,7 @@ def _pose_build_targets(rig, kp, vis, ground=True, torso_lean=True,
             n.normalize()
             # 手骨的 Y 是腕->中指根，Z 是食指->小指方向；所以列为 [X=n, Y=f, Z=l]
             f_cap = _pose_frame(n, f, l)
-            hand_frames[S] = r_body @ f_cap
+            hand_frames[S] = R @ f_cap
 
             target = to_rig(wrist, shift)
             target = _pose_clamp_reach(shoulder_points[S], target,
@@ -746,13 +755,13 @@ def _pose_build_targets(rig, kp, vis, ground=True, torso_lean=True,
                 warnings.append('手臂超出可达范围，已收缩：%s' % S)
             # 相对静止手掌坐标系求 delta，再套到控制骨静止朝向上
             f_rest = rest['hand_frame'][S]
-            r_delta = (r_body @ f_cap) @ f_rest.transposed()
+            hand_delta = (R @ f_cap) @ f_rest.transposed()
             q_rest = rig.data.bones['DEF-hand.' + S].matrix_local.to_quaternion()
             target_m = (Matrix.Translation(target)
-                        @ (r_delta @ q_rest.to_matrix()).to_4x4())
+                        @ (hand_delta @ q_rest.to_matrix()).to_4x4())
             hands[S] = target_m
 
-        # 手指：只取方向（r_body 旋转到 armature 静止坐标系），不取位置。
+        # 手指：只取方向（R 旋转到 armature 静止坐标系），不取位置。
         # 这样即使手掌被手臂可达范围夹住，手指也不会被拉长/扭到图像里的位置。
         fingers = {}
         for S, wrist_i in (('L', 62), ('R', 41)):
@@ -778,7 +787,7 @@ def _pose_build_targets(rig, kp, vis, ground=True, torso_lean=True,
                     d = b - a
                     if d.length < 1e-4:
                         break
-                    y = r_body @ d
+                    y = R @ d
                     if y.length < 1e-6:
                         break
                     y.normalize()
@@ -797,10 +806,10 @@ def _pose_build_targets(rig, kp, vis, ground=True, torso_lean=True,
                         break
                     x.normalize()
                     z = x.cross(y)
-                    R = Matrix(((x.x, y.x, z.x),
-                                (x.y, y.y, z.y),
-                                (x.z, y.z, z.z)))
-                    frames.append((bone_name, R))
+                    rot = Matrix(((x.x, y.x, z.x),
+                                  (x.y, y.y, z.y),
+                                  (x.z, y.z, z.z)))
+                    frames.append((bone_name, rot))
                 if len(frames) == 3:
                     chains.append((fname, frames))
             if chains:
@@ -818,17 +827,17 @@ def _pose_build_targets(rig, kp, vis, ground=True, torso_lean=True,
 
             f_c = toe - ankle
             if f_c.length < 1e-4:
-                f_c = r_body.transposed() @ Vector((0.0, -1.0, 0.0))
+                f_c = R.transposed() @ Vector((0.0, -1.0, 0.0))
             if f_c.length < 1e-6:
                 warnings.append('脚方向无法确定：%s' % S)
                 continue
             f_c.normalize()
             u_raw = ankle - heel
             if u_raw.length < 1e-4:
-                u_raw = r_body.transposed() @ Vector((0.0, 0.0, 1.0))
+                u_raw = R.transposed() @ Vector((0.0, 0.0, 1.0))
             u_c = u_raw - f_c * u_raw.dot(f_c)
             if u_c.length < 1e-6:
-                u_c = r_body.transposed() @ Vector((0.0, 0.0, 1.0))
+                u_c = R.transposed() @ Vector((0.0, 0.0, 1.0))
                 u_c = u_c - f_c * u_c.dot(f_c)
             u_c.normalize()
             l_c = u_c.cross(f_c)
@@ -854,11 +863,13 @@ def _pose_build_targets(rig, kp, vis, ground=True, torso_lean=True,
             f_rest = _pose_frame(r_f, r_l, r_u)
 
             target = to_rig(ankle, shift)
-            if (target - r_ankle).length > 1.2 or target.z < -0.2:
+            hip_target = to_rig(_v3(kp[9] if S == 'L' else kp[10]), shift)
+            if (target - hip_target).length > (rest['rest_thigh']
+                                               + rest['rest_shin']) * 1.25:
                 warnings.append('脚部目标异常，已跳过：%s' % S)
                 continue
-            r_delta = (r_body @ f_cap) @ f_rest.transposed()
-            feet[S] = Matrix.Translation(target) @ r_delta.to_4x4()
+            foot_delta = (R @ f_cap) @ f_rest.transposed()
+            feet[S] = Matrix.Translation(target) @ foot_delta.to_4x4()
 
         joints = {
             'shoulder_L': shoulder_points.get('L'),
@@ -892,27 +903,20 @@ def _pose_build_targets(rig, kp, vis, ground=True, torso_lean=True,
             'warnings': warnings,
         }
 
-    base = build(Vector((0.0, 0.0, 0.0)))
-    shift = Vector((0.0, 0.0, 0.0))
-    if ground and not global_root:
-        zs = []
-        for idx in (13, 14):
-            if vis[idx] >= 0.5:
-                zs.append(to_rig(_v3(kp[idx]), shift).z)
-        if zs:
-            dz = rest['rest_ankle_z'] - min(zs)
-            up_arm = r_body @ up_cap
-            if abs(dz) <= 0.6 and up_arm.z > 0.5:
-                shift = Vector((0.0, 0.0, dz))
-    targets = build(shift) if shift.length > 1e-9 else base
+    targets = build(Vector((0.0, 0.0, 0.0)))
     targets['scale'] = scale
-    targets['shift'] = shift
+    targets['shift'] = Vector((0.0, 0.0, 0.0))
     targets['root_yaw'] = root_yaw
-    targets['apply_root_yaw'] = bool(face_reference and not global_root)
-    targets['root_rotation'] = root_rotation
-    targets['global_root'] = global_root
-    # 不只倒立：坐/躺/跪姿的最低点也不一定是脚。统一按整个网格的最低点贴地。
-    targets['ground_via_mesh'] = bool(ground)
+    targets['facing'] = bool(face_reference)
+    # 躯干拆成骨盆（torso）+ 脊椎（spine_fk*）：应用时先转 torso，再把
+    # spine_delta 平摊到 4 节脊椎上，累计起来正好是 chest_delta。
+    targets['pelvis_delta'] = pelvis_delta
+    targets['spine_delta'] = spine_delta
+    targets['chest_delta'] = chest_delta
+    # 贴地不在 build 里做（要先摆好才量得到网格最低点），由应用阶段补偏移；
+    # 旧版是靠移动 rig:root 来贴地的，那会把根运动改掉。
+    targets['ground'] = bool(ground)
+    targets['global_root'] = False       # 兼容旧字段：root 不再被改写
     targets['warnings'] = targets.get('warnings', [])
     return targets
 
@@ -1043,66 +1047,83 @@ def _pose_apply_fingers(rig, targets, side=None):
                 bpy.context.view_layer.update()
 
 
+SPINE_FK_BONES = ('spine_fk', 'spine_fk.001', 'spine_fk.002', 'spine_fk.003')
+
+
+def _pose_add_warning(targets, text):
+    """警告去重：贴地会把同一个姿势重复应用几次，别把同一条刷 4 遍。"""
+    warns = targets.setdefault('warnings', [])
+    if text not in warns:
+        warns.append(text)
+
+
+def _pose_apply_spine(rig, delta):
+    """把“胸廓相对骨盆”的旋转平摊到整条脊椎 FK（spine_fk ~ .003）。
+
+    每节给 1/4，逐节累加，累计起来正好等于 delta —— 弯腰时是脊椎在弯，
+    而不是整个人从胯部倒下去。
+    """
+    if delta is None:
+        return
+    q = delta.to_quaternion()
+    if abs(q.angle) < math.radians(0.2):
+        return
+    per = Quaternion(q.axis, q.angle / len(SPINE_FK_BONES)).to_matrix()
+    for name in SPINE_FK_BONES:
+        pb = rig.pose.bones.get(name)
+        if pb is None:
+            continue
+        pos = pb.matrix.to_translation()
+        rot = per @ pb.matrix.to_quaternion().to_matrix()
+        _pose_set_bone_matrix(rig, name,
+                              Matrix.Translation(pos) @ rot.to_4x4())
+        bpy.context.view_layer.update()
+
+
+def _pose_apply_shoulders(rig, targets, max_deg=30.0):
+    """肩（锁骨）只转不移：靠旋转把肱骨头往参考的肩点靠。
+
+    锁骨长度是固定的，所以只能把肩关节转到“以锁骨根为球心、原始长度为半径”
+    的球面上最近的点；剩下的偏差留给手臂方向去吸收。不再给 shoulder 写位移，
+    避免捕捉后 shoulder.L/R 的 location 通道被 K 出位移。
+    """
+    sp = targets.get('shoulders_points') or {}
+    for S in ('L', 'R'):
+        pb = rig.pose.bones.get('shoulder.' + S)
+        target = sp.get(S)
+        if pb is None or target is None:
+            continue
+        pivot_pb = (rig.pose.bones.get('MCH-upper_arm_parent.' + S)
+                    or rig.pose.bones.get('upper_arm_ik.' + S))
+        if pivot_pb is None:
+            continue
+        head = pb.matrix.to_translation()
+        cur = pivot_pb.matrix.to_translation() - head
+        want = target - head
+        if cur.length < 1e-6 or want.length < 1e-6:
+            continue
+        q = cur.normalized().rotation_difference(want.normalized())
+        if abs(q.angle) < math.radians(0.3):
+            continue
+        ang = min(abs(q.angle), math.radians(max_deg))
+        rot = Quaternion(q.axis, ang).to_matrix() @ pb.matrix.to_quaternion().to_matrix()
+        _pose_set_bone_matrix(rig, 'shoulder.' + S,
+                              Matrix.Translation(head) @ rot.to_4x4())
+        bpy.context.view_layer.update()
+        # 旋转到极限还差得多时给个提示（只提示，不再偷偷平移）
+        rest = (pivot_pb.matrix.to_translation() - target).length
+        if rest > 0.08:
+            _pose_add_warning(
+                targets, '肩部只能旋转，离参考肩点还差 %.0f cm：%s'
+                % (rest * 100.0, S))
+
+
 def _pose_apply_torso_head(rig, targets):
     _pose_set_bone_matrix(rig, 'torso', targets['torso'])
     bpy.context.view_layer.update()
 
-    # torso 是刚性主控，而参考图只有肩/髋两组点。先把“肩中心 -> 目标肩中心”
-    # 的偏差分摊到脊椎 FK 上，让胸腔先弯过去；剩下的再由 shoulder 控制小范围
-    # 平移修正。否则大侧弯时肩膀要硬拉十几厘米，网格会拉出尖角。
-    pivots = {}
-    for S in ('L', 'R'):
-        pb = (rig.pose.bones.get('MCH-upper_arm_parent.' + S)
-              or rig.pose.bones.get('upper_arm_ik.' + S))
-        if pb is not None:
-            pivots[S] = pb.matrix.to_translation()
-    sp = targets.get('shoulders_points') or {}
-    if len(pivots) == 2 and sp.get('L') is not None and sp.get('R') is not None:
-        base_pb = rig.pose.bones.get('spine_fk.001')
-        if base_pb is not None:
-            cur = (pivots['L'] + pivots['R']) * 0.5
-            tgt = (sp['L'] + sp['R']) * 0.5
-            base = base_pb.matrix.to_translation()
-            vc = cur - base
-            vt = tgt - base
-            if vc.length > 1e-4 and vt.length > 1e-4:
-                q = vc.normalized().rotation_difference(vt.normalized())
-                ang = min(abs(q.angle), math.radians(50.0))
-                if ang > math.radians(3.0):
-                    for name in ('spine_fk.001', 'spine_fk.002',
-                                 'spine_fk.003'):
-                        pb = rig.pose.bones.get(name)
-                        if pb is None:
-                            continue
-                        inc = Quaternion(q.axis, ang / 3.0).to_matrix()
-                        rot = inc @ pb.matrix.to_quaternion().to_matrix()
-                        _pose_set_bone_matrix(
-                            rig, name,
-                            Matrix.Translation(pb.matrix.to_translation())
-                            @ rot.to_4x4())
-                        bpy.context.view_layer.update()
-
-    for S in ('L', 'R'):
-        pb = rig.pose.bones.get('shoulder.' + S)
-        target = targets['shoulders_points'].get(S)
-        if pb is None or target is None:
-            continue
-        # 目标点是肱骨头（手臂枢轴），不是锁骨根；用 MCH-upper_arm_parent 的
-        # pose 位置算当前枢轴，避免把手/手臂整体平移 8 cm。
-        pivot_pb = rig.pose.bones.get('MCH-upper_arm_parent.' + S)
-        if pivot_pb is None:
-            pivot_pb = rig.pose.bones.get('upper_arm_ik.' + S)
-        if pivot_pb is None:
-            continue
-        current = pb.matrix.copy()
-        delta = target - pivot_pb.matrix.to_translation()
-        if delta.length > 0.10:
-            targets.setdefault('warnings', []).append(
-                '肩部位置修正超过 10 cm，已截断：%s（%.2f m）' % (S, delta.length))
-            delta = delta.normalized() * 0.10
-        _pose_set_bone_matrix(rig, 'shoulder.' + S,
-                              Matrix.Translation(delta) @ current)
-    bpy.context.view_layer.update()
+    _pose_apply_spine(rig, targets.get('spine_delta'))
+    _pose_apply_shoulders(rig, targets)
 
     neck_q = targets.get('neck_rotation')
     if neck_q is not None:
@@ -1138,54 +1159,60 @@ def _pose_apply(rig, targets):
             _pose_set_bone_matrix(rig, 'foot_ik.' + S, targets['feet'][S])
     bpy.context.view_layer.update()
     _pose_apply_fingers(rig, targets)
-    _pose_apply_root_yaw(rig, targets)
-    _pose_ground_mesh(rig, targets)
     return targets
 
 
-def _pose_apply_root_yaw(rig, targets):
-    pb = rig.pose.bones.get('root')
-    if pb is None:
-        return
-    rot = targets.get('root_rotation')
-    if rot is None and not targets.get('apply_root_yaw', True):
-        return
-    # 保留 root 当前的位移（根运动），旋转统一回到静止朝向 + 参考朝向，
-    # 这样连续识别两张图不会把 yaw 累加。非直立时 rot 是完整的全局朝向。
-    loc = pb.matrix.to_translation()
-    rest_q = pb.bone.matrix_local.to_quaternion()
-    if rot is not None:
-        q_global = rot.to_quaternion()
-    else:
-        q_global = Quaternion((0.0, 0.0, 1.0),
-                              float(targets.get('root_yaw') or 0.0))
-    target_q = q_global @ rest_q
-    _pose_set_bone_matrix(
-        rig, 'root',
-        Matrix.Translation(loc) @ target_q.to_matrix().to_4x4())
-    bpy.context.view_layer.update()
-
-
-def _pose_ground_mesh(rig, targets):
-    """非直立姿势：按整个网格的最低点贴地（倒立时最低点是手/头）。"""
-    if not targets.get('ground_via_mesh'):
-        return
-    pb = rig.pose.bones.get('root')
-    mesh = _character_parts(rig)[2] if pb is not None else None
-    if pb is None or mesh is None:
-        return
+def _pose_mesh_lowest_z(rig):
+    """当前姿势下网格最低点的世界 z（用来贴地）。"""
+    parts = _character_parts(rig)
+    mesh = parts[2]
+    if mesh is None:
+        return None
     bpy.context.view_layer.update()
     dg = bpy.context.evaluated_depsgraph_get()
     ev = mesh.evaluated_get(dg)
     me = ev.to_mesh()
     zs = [(ev.matrix_world @ v.co).z for v in me.vertices]
     ev.to_mesh_clear()
-    if not zs:
-        return
-    m = pb.matrix.copy()
-    m.translation.z -= min(zs)
-    _pose_set_bone_matrix(rig, 'root', m)
-    bpy.context.view_layer.update()
+    return min(zs) if zs else None
+
+
+def _pose_shift_targets(targets, delta):
+    """把所有目标刚性平移（贴地用；手指只有朝向，不用动）。"""
+    delta = Vector(delta)
+    if delta.length < 1e-9:
+        return targets
+    T = Matrix.Translation(delta)
+    if targets.get('torso') is not None:
+        targets['torso'] = T @ targets['torso']
+    for key in ('hands', 'feet'):
+        for S, m in (targets.get(key) or {}).items():
+            targets[key][S] = T @ m
+    for S, p in (targets.get('shoulders_points') or {}).items():
+        if p is not None:
+            targets['shoulders_points'][S] = p + delta
+    for k, p in (targets.get('joints') or {}).items():
+        if p is not None:
+            targets['joints'][k] = p + delta
+    targets['shift'] = Vector(targets.get('shift') or Vector((0, 0, 0))) + delta
+    return targets
+
+
+def _pose_ground_targets(rig, targets, apply_fn, floor=0.0):
+    """按网格最低点贴地：位移加到姿势目标上，不动 rig:root。
+
+    姿势是刚体，平移一次就够了；再量一次只为确认（浮点/蒙皮误差）。
+    """
+    for _ in range(3):
+        low = _pose_mesh_lowest_z(rig)
+        if low is None:
+            break
+        dz = floor - low
+        if abs(dz) < 5e-4:
+            break
+        _pose_shift_targets(targets, Vector((0.0, 0.0, dz)))
+        apply_fn(rig, targets)
+    return targets
 
 
 def _pose_apply_fk(rig, targets, ground=True):
@@ -1230,26 +1257,6 @@ def _pose_apply_fk(rig, targets, ground=True):
                 rig, 'foot_fk.' + S,
                 Matrix.Translation(pos) @ (r_delta @ rest_q).to_matrix().to_4x4())
             bpy.context.view_layer.update()
-
-    if ground and not targets.get('global_root'):
-        rest_z = rig.data.bones['DEF-foot.L'].head_local.z
-        zs = []
-        for S in ('L', 'R'):
-            pb = rig.pose.bones.get('DEF-foot.' + S)
-            if pb is not None:
-                zs.append(pb.matrix.to_translation().z)
-        if zs:
-            dz = rest_z - min(zs)
-            if abs(dz) <= 0.6:
-                ptorso = rig.pose.bones.get('torso')
-                if ptorso is not None:
-                    _pose_set_bone_matrix(
-                        rig, 'torso',
-                        Matrix.Translation(Vector((0.0, 0.0, dz)))
-                        @ ptorso.matrix)
-                    bpy.context.view_layer.update()
-    _pose_apply_root_yaw(rig, targets)
-    _pose_ground_mesh(rig, targets)
     return targets
 
 
@@ -1261,19 +1268,81 @@ def _pose_apply_payload(rig, payload, scene):
         payload,
         mirror=bool(scene.character_pose_mirror),
         use_depth=float(scene.character_pose_depth))
+    ground = bool(scene.character_pose_ground)
     targets = _pose_build_targets(
-        rig, kp, vis, ground=bool(scene.character_pose_ground),
+        rig, kp, vis, ground=ground,
         torso_lean=bool(getattr(scene, 'character_pose_torso', True)),
         head_turn=bool(getattr(scene, 'character_pose_head', True)),
         face_reference=bool(getattr(scene, 'character_pose_facing', True)))
     if not getattr(scene, 'character_pose_fingers', True):
         targets['fingers'] = {}
-    if getattr(scene, 'character_pose_limbs', 'fk') == 'ik':
-        _pose_apply(rig, targets)
+    limbs = getattr(scene, 'character_pose_limbs', 'fk')
+    if limbs == 'ik':
+        apply_fn = _pose_apply
     else:
-        _pose_apply_fk(rig, targets,
-                       ground=bool(scene.character_pose_ground))
+        apply_fn = _pose_apply_fk
+    apply_fn(rig, targets)
+    if ground:
+        # 贴地 = 把整个姿势平移，rig:root 一动不动（根运动保持原样）。
+        _pose_ground_targets(rig, targets, apply_fn)
+    if limbs == 'fk2ik':
+        # 按 FK 摆（肘/膝更贴参考），再把姿势吸附到 IK 控制器并切回 IK 模式，
+        # 这样你可以继续用 IK 控制器改动作。
+        drift = _pose_snap_fk_to_ik(rig, targets)
+        if drift > 0.002:
+            _pose_add_warning(
+                targets, '切回 IK 时姿势有 %.0f mm 偏移（肘/膝受 IK 平面限制）'
+                % (drift * 1000.0))
+    targets['limbs'] = limbs
     return targets
+
+
+def _pose_snap_fk_to_ik(rig, targets=None):
+    """FK 姿势 -> IK 控制器：把 hand_ik / foot_ik 摆到 FK 链末端，再把 IK_FK 切回 0。
+
+    Rigify 的 IK 肘/膝朝向由手/脚控制器的朝向决定（swing 骨），所以把 FK 的手/脚
+    世界矩阵原样交给 IK 控制器，解出来的肘/膝和 FK 一致（实测 0.0 mm）。
+    返回吸附前后 DEF 关节的最大偏差。
+    """
+    watch = ('DEF-forearm.L', 'DEF-forearm.R', 'DEF-hand.L', 'DEF-hand.R',
+             'DEF-shin.L', 'DEF-shin.R', 'DEF-foot.L', 'DEF-foot.R')
+    bpy.context.view_layer.update()
+    before = {n: rig.pose.bones[n].head.copy()
+              for n in watch if rig.pose.bones.get(n) is not None}
+
+    for S in ('L', 'R'):
+        fk = rig.pose.bones.get('hand_fk.' + S)
+        if fk is not None:
+            _pose_set_bone_matrix(rig, 'hand_ik.' + S, fk.matrix.copy())
+    for S in ('L', 'R'):
+        fk = rig.pose.bones.get('foot_fk.' + S)
+        ik = rig.pose.bones.get('foot_ik.' + S)
+        if fk is None or ik is None:
+            continue
+        # foot_ik 的静止朝向和 foot_fk 不同，按“世界朝向增量”换算，别直接套矩阵
+        delta = (fk.matrix.to_quaternion()
+                 @ fk.bone.matrix_local.to_quaternion().inverted())
+        rest_q = ik.bone.matrix_local.to_quaternion()
+        _pose_set_bone_matrix(
+            rig, 'foot_ik.' + S,
+            Matrix.Translation(fk.matrix.to_translation())
+            @ (delta @ rest_q).to_matrix().to_4x4())
+    bpy.context.view_layer.update()
+
+    for S in ('L', 'R'):
+        for name in ('upper_arm_parent.' + S, 'thigh_parent.' + S):
+            pb = rig.pose.bones.get(name)
+            if pb is not None and 'IK_FK' in pb:
+                pb['IK_FK'] = 0.0
+    bpy.context.view_layer.update()
+
+    drift = 0.0
+    for n, p in before.items():
+        pb = rig.pose.bones.get(n)
+        if pb is not None:
+            drift = max(drift, (pb.head - p).length)
+    return drift
+
 
 
 def _pose_summary(payload, targets):
@@ -1282,6 +1351,10 @@ def _pose_summary(payload, targets):
     shift = targets.get('shift', Vector((0, 0, 0)))
     warnings = targets.get('warnings') or []
     text = '已应用 %s：缩放 %.2f，贴地偏移 %.3f m' % (backend, scale, shift.z)
+    if targets.get('limbs') == 'fk2ik':
+        text += '，已切回 IK'
+    elif targets.get('limbs') == 'ik':
+        text += '，IK'
     if warnings:
         text += '（%d 条提示）' % len(warnings)
     return text
@@ -2254,10 +2327,14 @@ def register():
         default='auto')
     bpy.types.Scene.character_pose_ground = bpy.props.BoolProperty(
         name='贴地',
-        description='按整个网格的最低点贴地（直立是脚、坐/躺是背/臀、倒立是手/头）',
+        description='按整个网格的最低点贴地（直立是脚、坐/躺是背/臀、倒立是手/头）；'
+                    '位移落在控制器上，不动 rig:root',
         default=True)
     bpy.types.Scene.character_pose_depth = bpy.props.FloatProperty(
-        name='深度', min=0.0, max=1.0, default=0.7)
+        name='深度',
+        description='识别结果前后方向的缩放：1 = 完全按模型估的 3D 深度；'
+                    '觉得脚/腿前后错位时可以降到 0.4–0.6，完全平面用 0',
+        min=0.0, max=1.0, default=1.0)
     bpy.types.Scene.character_pose_mirror = bpy.props.BoolProperty(
         name='镜像', default=False)
     bpy.types.Scene.character_pose_torso = bpy.props.BoolProperty(
@@ -2265,17 +2342,22 @@ def register():
     bpy.types.Scene.character_pose_head = bpy.props.BoolProperty(
         name='头/颈转向', default=True)
     bpy.types.Scene.character_pose_facing = bpy.props.BoolProperty(
-        name='匹配朝向', default=True)
+        name='匹配朝向',
+        description='开：角色朝向跟参考一致（参考侧身/背身，角色也侧身/背身）；'
+                    '关：姿势不变，角色绕 Z 转回默认朝向（面朝 -Y）',
+        default=True)
     bpy.types.Scene.character_pose_fingers = bpy.props.BoolProperty(
         name='手指',
         description='用 MHR70 的手部关键点摆手指（SAM 3D Body 会顺手部精修）',
         default=True)
     bpy.types.Scene.character_pose_limbs = bpy.props.EnumProperty(
         name='四肢',
-        description='FK：肘/膝更贴近参考；IK：手/脚落点更精确',
-        items=[('fk', 'FK', '按参考的肩-肘-腕/髋-膝-踝方向摆 FK 骨'),
+        description='FK：肘/膝更贴近参考；IK：手/脚落点更精确；'
+                    'FK → IK：按 FK 摆，摆好后把控制器切回 IK（继续用 IK 编辑）',
+        items=[('fk2ik', 'FK → IK', '按 FK 摆姿势，然后吸附到 IK 控制器并切回 IK 模式'),
+               ('fk', 'FK', '按参考的肩-肘-腕/髋-膝-踝方向摆 FK 骨'),
                ('ik', 'IK', '用 IK 把手/脚放到参考位置，肘/膝由 IK 平面决定')],
-        default='fk')
+        default='fk2ik')
     bpy.types.Scene.character_pose_message = bpy.props.StringProperty(
         name='姿态捕捉状态', default='')
     bpy.types.Scene.character_pose_stage = bpy.props.StringProperty(

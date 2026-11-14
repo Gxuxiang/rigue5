@@ -17,7 +17,7 @@ import sys
 import traceback
 
 import bpy
-from mathutils import Matrix, Vector
+from mathutils import Matrix, Quaternion, Vector
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.join(HERE, 'character_tools.py')
@@ -39,13 +39,18 @@ def close(a, b, eps=1e-4):
     return (Vector(a) - Vector(b)).length <= eps
 
 
-def build_rest_keypoints(rig):
+def build_rest_keypoints(rig, posed=False):
     b = rig.data.bones
+    pb = rig.pose.bones
 
     def head(name):
+        if posed:
+            return pb[name].head.copy()
         return b[name].head_local.copy()
 
     def tail(name):
+        if posed:
+            return pb[name].tail.copy()
         return b[name].tail_local.copy()
 
     kp = [[0.0, 0.0, 0.0] for _ in range(70)]
@@ -225,15 +230,79 @@ def main():
     check('missing left wrist keeps right', 'R' in t_missing['hands'], '')
 
     # ---------------------------------------------------------- ground contact
-    kp_up = [list(p) for p in kp]
-    for i in (13, 14, 15, 16, 17, 18, 19, 20):
-        kp_up[i][1] -= 0.12          # capture y 向下，减 y = 抬高
-    t_ground = mod['_pose_build_targets'](rig, kp_up, vis, ground=True)
-    check('ground shift applied', t_ground['shift'].z < -0.1,
-          'shift=%.4f' % t_ground['shift'].z)
-    lowest = min(v.to_translation().z for v in t_ground['feet'].values())
-    check('ground lowest ankle', abs(lowest - rest['rest_ankle_z']) < 0.01,
-          'lowest=%.4f rest=%.4f' % (lowest, rest['rest_ankle_z']))
+    # 贴地由 _pose_ground_targets 在摆完姿势后补偏移：整体平移姿势，
+    # 不允许动 rig:root（根运动）。躺姿最能体现：不贴地时整个人是悬空的。
+    kp_flat = [list(p) for p in kp]
+    hip_mid = Vector(((kp[9][0] + kp[10][0]) / 2,
+                      (kp[9][1] + kp[10][1]) / 2,
+                      (kp[9][2] + kp[10][2]) / 2))
+    lay = Matrix.Rotation(math.radians(80.0), 4, 'X')
+    for i in list(range(0, 9)) + list(range(21, 70)):
+        p = lay @ (Vector(kp_flat[i]) - hip_mid)
+        kp_flat[i] = list(p + hip_mid)
+    reset_rig(rig)
+    t_ground = mod['_pose_build_targets'](rig, kp_flat, vis, ground=True)
+    root_before = rig.pose.bones['root'].matrix_basis.copy()
+    mod['_pose_apply_fk'](rig, t_ground)
+    low0 = mod['_pose_mesh_lowest_z'](rig)
+    mod['_pose_ground_targets'](rig, t_ground, mod['_pose_apply_fk'])
+    bpy.context.view_layer.update()
+    low = mod['_pose_mesh_lowest_z'](rig)
+    check('ground: mesh on floor', low is not None and abs(low) < 0.002,
+          'min_z=%.4f' % (low if low is not None else 1e9))
+    check('ground: shift matches offset',
+          low0 is not None and abs(t_ground['shift'].z + low0) < 1e-3,
+          'before=%.4f shift_z=%.4f' % (low0 if low0 is not None else -1,
+                                        t_ground['shift'].z))
+    root_now = rig.pose.bones['root'].matrix_basis
+    root_delta = max(abs(root_now[i][j] - root_before[i][j])
+                     for i in range(4) for j in range(4))
+    check('ground: root untouched', root_delta < 1e-9,
+          'delta=%.10f' % root_delta)
+    chest = (t_ground['joints']['shoulder_L'] + t_ground['joints']['shoulder_R']) * 0.5
+    hip = (t_ground['joints']['hip_L'] + t_ground['joints']['hip_R']) * 0.5
+    tilt = math.degrees((chest - hip).angle(Vector((0.0, 0.0, 1.0))))
+    check('lying: body is horizontal', tilt > 60.0, 'chest tilt=%.1f deg' % tilt)
+    reset_rig(rig)
+
+    # ---------------------------------------------------------- root stays put
+    # 姿态捕捉不允许碰 rig:root（位置和旋转都不动），否则会污染根运动。
+    reset_rig(rig)
+    t_plain = mod['_pose_build_targets'](rig, kp, vis, ground=True)
+    mod['_pose_apply_fk'](rig, t_plain)
+    mod['_pose_ground_targets'](rig, t_plain, mod['_pose_apply_fk'])
+    m = rig.pose.bones['root'].matrix_basis
+    delta = max(abs(m[i][j] - (1.0 if i == j else 0.0))
+                for i in range(4) for j in range(4))
+    check('root untouched by capture', delta < 1e-9, 'delta=%.10f' % delta)
+    reset_rig(rig)
+
+    # ---------------------------------------------------------- lean fidelity
+    # 参考图弯腰就弯腰：躯干增量要和参考一致（不再有 8° 死区 + 0.9 缩放 + 35° 上限）
+    def keypoints_for_pose(deg):
+        reset_rig(rig)
+        mod_rot = Quaternion(Vector((1.0, 0.0, 0.0)), math.radians(deg))
+        for name in ('torso',):
+            pb = rig.pose.bones[name]
+            pb.rotation_mode = 'QUATERNION'
+            pb.rotation_quaternion = mod_rot
+        bpy.context.view_layer.update()
+        kp2, vis2 = build_rest_keypoints(rig, posed=True)
+        reset_rig(rig)
+        return kp2, vis2
+
+    kp_lean, vis_lean = keypoints_for_pose(40.0)
+    t_lean = mod['_pose_build_targets'](rig, kp_lean, vis_lean, ground=False)
+    lean_chest = math.degrees(
+        t_lean['chest_delta'].to_quaternion().angle)
+    lean_pelvis = math.degrees(
+        t_lean['pelvis_delta'].to_quaternion().angle)
+    lean_spine = math.degrees(
+        t_lean['spine_delta'].to_quaternion().angle)
+    check('lean fidelity 40deg', abs(lean_chest - 40.0) < 2.0,
+          'chest=%.1f deg' % lean_chest)
+    check('lean goes to spine', lean_pelvis < 3.0 and lean_spine > 30.0,
+          'pelvis=%.1f spine=%.1f' % (lean_pelvis, lean_spine))
 
     # ---------------------------------------------------------- torso lean / head turn
     reset_rig(rig)
@@ -255,17 +324,56 @@ def main():
         kp_turn[i] = list(p + head_center)
 
     t_turn = mod['_pose_build_targets'](rig, kp_turn, vis, ground=False)
-    torso_rest_q = rest['torso_rest'].to_quaternion()
-    torso_ang = math.degrees(
-        t_turn['torso'].to_quaternion().rotation_difference(torso_rest_q).angle)
+    torso_ang = math.degrees(t_turn['chest_delta'].to_quaternion().angle)
+    spine_ang = math.degrees(t_turn['spine_delta'].to_quaternion().angle)
     head_rest_q = rig.data.bones['head'].matrix_local.to_quaternion()
     head_q = t_turn.get('head_rotation')
     head_ang = (math.degrees(head_q.rotation_difference(head_rest_q).angle)
                 if head_q is not None else 0.0)
     check('torso lean applied', abs(torso_ang) > 5.0,
-          'angle=%.2f deg' % torso_ang)
+          'chest=%.2f spine=%.2f deg' % (torso_ang, spine_ang))
     check('head turn applied', head_q is not None and abs(head_ang) > 10.0,
           'angle=%.2f deg' % head_ang)
+
+    # 应用一遍，确认 shoulder 只转不移、脊椎真的转了
+    reset_rig(rig)
+    mod['_pose_apply_fk'](rig, t_turn)
+    bpy.context.view_layer.update()
+    shoulder_loc = max(rig.pose.bones['shoulder.' + S].location.length
+                       for S in ('L', 'R'))
+    check('shoulder rotate only', shoulder_loc < 1e-4,
+          'location=%.8f m' % shoulder_loc)
+    spine_rot = 0.0
+    for name in ('spine_fk.001', 'spine_fk.002', 'spine_fk.003'):
+        pb = rig.pose.bones.get(name)
+        if pb is not None:
+            spine_rot += math.degrees(pb.matrix_basis.to_quaternion().angle)
+    check('spine_fk actually bends', spine_rot > 10.0,
+          'sum=%.1f deg' % spine_rot)
+    reset_rig(rig)
+
+    # ---------------------------------------------------------- FK -> IK 吸附
+    # 按 FK 摆好之后要能切回 IK 控制器，而且姿势不能变。
+    reset_rig(rig)
+    t_snap = mod['_pose_build_targets'](rig, kp_turn, vis, ground=False)
+    mod['_pose_apply_fk'](rig, t_snap)
+    bpy.context.view_layer.update()
+    watch = ('DEF-hand.L', 'DEF-hand.R', 'DEF-foot.L', 'DEF-foot.R',
+             'DEF-forearm.L', 'DEF-shin.L')
+    fk_pos = {n: rig.pose.bones[n].head.copy() for n in watch}
+    drift = mod['_pose_snap_fk_to_ik'](rig, t_snap)
+    bpy.context.view_layer.update()
+    ik_now = {n: rig.pose.bones[n].head.copy() for n in watch}
+    pose_delta = max((ik_now[n] - fk_pos[n]).length for n in watch)
+    modes = [rig.pose.bones['%s.%s' % (p, S)]['IK_FK']
+             for S in ('L', 'R')
+             for p in ('upper_arm_parent', 'thigh_parent')]
+    check('fk2ik switches to IK', all(abs(v) < 1e-6 for v in modes),
+          'IK_FK=%s' % modes)
+    check('fk2ik keeps the pose',
+          pose_delta < 0.002 and drift < 0.002,
+          'pose=%.5f m drift=%.5f m' % (pose_delta, drift))
+    reset_rig(rig)
 
     # ---------------------------------------------------------- B_rig discovery
     try:
